@@ -60,7 +60,7 @@ canvas.overlayCanvas {
 <body>
 
 <div class="header">
-    <h2>OFP Annotation Tool v2.2</h2>
+    <h2>OFP Annotation Tool v2.3</h2>
 </div>
 
 <div class="upload">
@@ -1929,12 +1929,17 @@ const intamAgeAnnotations = [];
 let forecastWaypointHighlights = [];
 const forecastRecommendationAnnotations = [];
 const legsWaypointMatches = [];
+window.burnoffTime = "";
+window.planNumber = "";
+let edtoHighlights = [];
+
 
 let currentWxAirport = null;
 let currentWxHasBad = false;
 let currentWxAirportHeader = null;
 const badWxAirports = [];
 let badWxHighlights = [];
+let badWxSummaryAnnotations = [];
 
 let dep = "";
 let arr = "";
@@ -2098,9 +2103,6 @@ fileInput.addEventListener("change", async (e) => {
 
         // Forecast Winds
         if (upper.includes("FORECAST WIND -")) {
-
-            forecastWindPages.add(p);
-
             if (forecastStartPage === null) {
                 forecastStartPage = p;
             }
@@ -2130,6 +2132,22 @@ fileInput.addEventListener("change", async (e) => {
                     atcFlightPlanPage = p;
                     break;
                 }
+            }
+        }
+
+        // Populate Forecast Wind Pages
+        if (
+            forecastStartPage !== null &&
+            atcFlightPlanPage !== null
+        ) {
+
+            for (
+                let page = forecastStartPage;
+                page < atcFlightPlanPage;
+                page++
+            ) {
+
+                forecastWindPages.add(page);
             }
         }
 
@@ -2315,7 +2333,8 @@ fileInput.addEventListener("change", async (e) => {
 
             if (
                 /^(?:[A-Z]{2}|[A-Z]{3}|[A-Z]{5})$/.test(token) ||
-                /^\d{2}[NSEW]\d{2}$/.test(token)
+                /^\d{2}[NSEW]\d{2}$/.test(token) ||
+                /^[A-Z]{2}\d{2}[A-Z]$/.test(token)
             ) {
 
                 let trkToken = null;
@@ -2354,10 +2373,6 @@ fileInput.addEventListener("change", async (e) => {
 
                     break;
                 }
-
-                console.log(
-                    `WAYPOINT: ${token} | FL: ${flightLevel} | TRK TOKEN: ${trkToken} | TRK: ${track} | PAGE: ${p}`
-                );
 
                 legsWaypointMatches.push({
                     page: p,
@@ -2408,10 +2423,6 @@ fileInput.addEventListener("change", async (e) => {
 
                 const waypointBefore = tokens[waypointIndex] || null;
 
-                console.log(
-                    `CLB ${code} | ${before5.slice(0, 5)} | ${waypointBefore} | TRK ${track}`
-                );
-
                 clbMatches.push({
                     page: p,
                     code,
@@ -2421,13 +2432,27 @@ fileInput.addEventListener("change", async (e) => {
                 });
             }
         }
+    }
+
+    // =================================================
+    // REMOVE WAYPOINTS WITHOUT FL OR TRK
+    // =================================================
+
+    legsWaypointMatches.splice(
+        0,
+        legsWaypointMatches.length,
+        ...legsWaypointMatches.filter(
+            w =>
+                w.flightLevel !== null &&
+                w.trkToken !== null
+        )
+    );
 
     console.log(
         "ALL LEGS WAYPOINT/TRK:",
         legsWaypointMatches
-        );
+    );
 
-    }
 
     const highGroundSummary = summarizeTimeRanges(
         codeList.map(c => c.before16)
@@ -2479,25 +2504,146 @@ fileInput.addEventListener("change", async (e) => {
         results.map(r => r.before2)
     );
 
-    ///RTOW extraction
+    // =====================================================
+    // RTOW EXTRACTION
+    // =====================================================
+
     let rtow = null;
+    let rtowType = null;
+    let rtowDisplay = null;
+
+    const rtowMatches = [];
 
     for (let p = 2; p <= Math.min(4, pdf.numPages); p++) {
 
         const pg = pages[p - 1];
-
         const text = pg.text;
 
-        const rtowMatch = text.match(/RTOW\s*(?!\()[^\d]*(\d{6})/i);
+        // Find RTOW (PERF), RTOW (LAND) and RTOW (STRUC)
+        const regex = /RTOW\s*\(\s*(PERF|LAND|STRUC)\s*\)\s*(\d{6})/gi;
 
-        if (rtowMatch) {
-            rtow = (Math.floor(Number(rtowMatch[1]) / 100) * 100) / 1000;
-            break; // stop once found
+        let match;
+
+        while ((match = regex.exec(text)) !== null) {
+
+            rtowMatches.push({
+                type: match[1].toUpperCase(),
+                value: Number(match[2])
+            });
         }
     }
+
+    // =====================================================
+    // FIND LOWEST RTOW
+    // =====================================================
+
+    if (rtowMatches.length > 0) {
+
+        const lowestRTOW = rtowMatches.reduce(
+            (lowest, current) =>
+                current.value < lowest.value
+                    ? current
+                    : lowest
+        );
+
+        // =================================================
+        // CONVERT TO TONNES (ROUND DOWN TO 100 KG)
+        // =================================================
+
+        rtow =
+            (Math.floor(lowestRTOW.value / 100) * 100) / 1000;
+
+        rtowType = lowestRTOW.type;
+
+        rtowDisplay =
+            `${rtow.toFixed(1)} (${rtowType})`;
+    }
+
+    console.log("RTOW RESULTS:", rtowMatches);
+    console.log("SELECTED RTOW:", rtowDisplay);
     
     ///EDTO INFORMATION
     let edtoGroups = [];
+    let edtoHighlights = [];
+
+    window.edtoHighlights = edtoHighlights;
+    window.edtoPdfHighlights = [];
+
+    function getEDTOItemPosition(pageNumber, tokenIndex, value) {
+
+        const pg = pages[pageNumber - 1];
+
+        if (!pg || !pg.items) {
+            return null;
+        }
+
+        const item = pg.items[tokenIndex];
+
+        if (!item) {
+
+            console.warn(
+                "EDTO HIGHLIGHT ITEM NOT FOUND:",
+                {
+                    pageNumber,
+                    tokenIndex,
+                    value
+                }
+            );
+
+            return null;
+        }
+
+        const itemText = item.str || "";
+
+        // Find the exact airport/time text inside the PDF item
+        const startIndex = itemText.indexOf(value);
+
+        if (startIndex === -1) {
+
+            console.warn(
+                "EDTO HIGHLIGHT TEXT NOT FOUND:",
+                {
+                    pageNumber,
+                    tokenIndex,
+                    value,
+                    itemText
+                }
+            );
+
+            return null;
+        }
+
+        // PDF.js text items are normally horizontally scaled uniformly.
+        // Calculate the approximate width of each character.
+        const charWidth =
+            item.width / itemText.length;
+
+        const prefixWidth =
+            charWidth * startIndex;
+
+        const valueWidth =
+            charWidth * value.length;
+
+        return {
+            page: pageNumber,
+            itemIndex: tokenIndex,
+            tokenIndex: tokenIndex,
+            value: value,
+
+            x:
+                item.transform[4] +
+                prefixWidth,
+
+            y:
+                item.transform[5],
+
+            width:
+                valueWidth,
+
+            height:
+                item.height
+        };
+    }
 
     // STEP 2: HARD GUARD (ONLY ONCE)
     if (!edtoPage) {
@@ -2510,17 +2656,21 @@ fileInput.addEventListener("change", async (e) => {
         }
 
         function isAirport(t) {
-            return /^[A-Z]{4}(\s*\d+)?$/.test(t);
+            return /[A-Z]{4}/.test(t);
         }
 
         function cleanAirport(t) {
-            return (t.match(/^[A-Z]{4}/) || [null])[0];
+            const match = t.match(/[A-Z]{4}/);
+            return match ? match[0] : null;
         }
 
         const startPage = edtoPage;
-        const endPage = Math.min(edtoPage + 1, pdf.numPages);
+        const endPage = edtoEndPage;
 
         edtoGroups = []; // reset ONCE here only
+
+        let processedUntilPage = startPage;
+        let processedUntilToken = -1;
 
         for (let p = startPage; p <= endPage; p++) {
 
@@ -2532,67 +2682,201 @@ fileInput.addEventListener("change", async (e) => {
             const upper = pg.upperText;
 
             let lastTime = null;
+            let startTimePosition = null;
+            let endTimePosition = null;
 
             for (let i = 0; i < tokens.length; i++) {
+
+                if (
+                    p < processedUntilPage ||
+                    (
+                        p === processedUntilPage &&
+                        i <= processedUntilToken
+                    )
+                ) {
+                    continue;
+                }
 
                 const t = tokens[i];
 
                 if (isEDTOTime(t)) {
-                    lastTime = t.replace(/\s+/g, "");
+
+                    lastTime =
+                        t.replace(/\s+/g, "");
+
+                    startTimePosition = {
+                        page: p,
+                        tokenIndex: i,
+                        type: "time",
+                        value: lastTime
+                    };
                 }
 
                 if (t.includes("ENTRY")) {
 
                     let airport1 = null;
+                    let airport1Position = null;
                     let airportLast = null;
                     let middleAirports = [];
 
                     let start = lastTime;
                     let end = null;
 
+                    let airportPositions = [];
+                    let airportsBeforeExit = [];
+
                     // Airport immediately before ENTRY
                     for (let j = i - 1; j >= 0; j--) {
                         if (isAirport(tokens[j])) {
                             airport1 = cleanAirport(tokens[j]);
+
+                            const occurrence =
+                                tokens
+                                    .slice(0, j + 1)
+                                    .filter(t =>
+                                        cleanAirport(t) === airport1
+                                    )
+                                    .length - 1;
+
+                            airport1Position = {
+                                page: p,
+                                tokenIndex: j,
+                                type: "airport",
+                                value: airport1,
+                                occurrence: occurrence
+                            };
+
                             break;
                         }
                     }
 
-                    let airportsBeforeExit = [];
+                    // Scan until EXIT across all pages
+                    let exitFound = false;
 
-                    // Scan until EXIT
-                    for (let k = i + 1; k < tokens.length; k++) {
+                    for (let scanPage = p; scanPage <= endPage && !exitFound; scanPage++) {
 
-                        const tk = tokens[k];
+                        const scanPg = pages[scanPage - 1];
+                        const scanTokens = scanPg.tokens;
 
-                        if (tk.includes("EXIT")) {
+                        const startToken =
+                            scanPage === p
+                                ? i + 1
+                                : 0;
 
-                            // Find exit time
-                            for (let j = k - 1; j >= 0; j--) {
-                                if (isEDTOTime(tokens[j])) {
-                                    end = tokens[j].replace(/\s+/g, "");
-                                    break;
-                                }
-                            }
+                        for (
+                            let k = startToken;
+                            k < scanTokens.length;
+                            k++
+                        ) {
 
-                            // Last airport before EXIT
-                            airportLast = airportsBeforeExit.at(-1) || null;
+                        const tk = scanTokens[k];
 
-                            // All airports except the last one
-                            middleAirports = airportsBeforeExit.slice(0, -1);
+                        // Stop scanning when the next EDTO section begins
+                        if (tk.includes("EDTO ENROUTE ALTN AIRPORTS:")) {
 
+                            console.log(
+                                `EDTO AIRPORT SCAN STOPPED | PAGE ${scanPage} | TOKEN ${k}:`,
+                                tk
+                            );
+
+                            exitFound = true;
                             break;
                         }
 
-                        if (isAirport(tk)) {
+                        if (tk.includes("EXIT")) {
 
-                            const airport = cleanAirport(tk);
+                                console.log(
+                                    `EDTO EXIT FOUND | PAGE ${scanPage} | TOKEN ${k}`
+                                );
+
+                                // Find exit time on the current scan page
+                                
+
+                                for (let j = k - 1; j >= 0; j--) {
+                                    if (isEDTOTime(scanTokens[j])) {
+
+                                        end =
+                                            scanTokens[j].replace(/\s+/g, "");
+
+                                        endTimePosition = {
+                                            page: scanPage,
+                                            tokenIndex: j,
+                                            type: "time",
+                                            value: end
+                                        };
+
+                                        break;
+                                    }
+                                }
+
+                                // The final airport occurrence before EXIT is the EXIT airport
+                                const exitAirportPosition =
+                                    airportPositions.at(-1) || null;
+
+                                airportLast =
+                                    exitAirportPosition
+                                        ? exitAirportPosition.value
+                                        : null;
+
+                                // All UNIQUE airport names before the EXIT airport
+                                middleAirports = [
+                                    ...new Set(
+                                        airportPositions
+                                            .slice(0, -1)
+                                            .map(a => a.value)
+                                    )
+                                ];
+
+                                // Mark everything through this EXIT as already processed
+                                processedUntilPage = scanPage;
+                                processedUntilToken = k;
+
+                                exitFound = true;
+
+                                break;
+                            }
 
                             if (
-                                airport &&
-                                airportsBeforeExit[airportsBeforeExit.length - 1] !== airport
+                                tk.startsWith("SIA") ||
+                                tk.startsWith("PAGE")
                             ) {
-                                airportsBeforeExit.push(airport);
+                                console.log(
+                                    `EDTO AIRPORT SCAN | PAGE ${scanPage} | TOKEN ${k}:`,
+                                    tk,
+                                    "→ IGNORED"
+                                );
+                                continue;
+                            }
+
+                            if (isAirport(tk)) {
+                                const airport = cleanAirport(tk);
+
+                                if (airport) {
+
+                                    const occurrence =
+                                        airportPositions.filter(
+                                            a =>
+                                                a.value === airport
+                                        ).length;
+
+                                    airportPositions.push({
+                                        page: scanPage,
+                                        tokenIndex: k,
+                                        type: "airport",
+                                        value: airport,
+                                        occurrence: occurrence
+                                    });
+
+                                    // Keep a separate list of unique airport names
+                                    if (!airportsBeforeExit.includes(airport)) {
+                                        airportsBeforeExit.push(airport);
+                                    }
+
+                                    console.log(
+                                        "EDTO AIRPORT SAVED:",
+                                        airportPositions.at(-1)
+                                    );
+                                }
                             }
                         }
                     }
@@ -2622,19 +2906,186 @@ fileInput.addEventListener("change", async (e) => {
 
                     const duration = diffEDTO(start, end);
 
+                    // =========================================
+                    // COLLECT EDTO VISUAL HIGHLIGHTS
+                    // =========================================
+
+                    // ENTRY
+                    if (airport1Position) {
+
+                        const pos = getEDTOItemPosition(
+                            airport1Position.page,
+                            airport1Position.tokenIndex,
+                            airport1Position.value
+                        );
+
+                        if (pos) {
+
+                            edtoHighlights.push({
+                                ...airport1Position,
+                                role: "entry",
+                                ...pos
+                            });
+                        }
+                    }
+
+                    // FIRST occurrence of each MIDDLE airport
+                    for (const airportName of middleAirports) {
+
+                        const airport =
+                            airportPositions.find(a =>
+                                a.value === airportName
+                            );
+
+                        if (!airport) {
+                            continue;
+                        }
+
+                        const pos = getEDTOItemPosition(
+                            airport.page,
+                            airport.tokenIndex,
+                            airport.value
+                        );
+
+                        if (pos) {
+
+                            edtoHighlights.push({
+                                ...airport,
+                                role: "middle",
+                                ...pos
+                            });
+                        }
+                    }
+
+                    // EXIT
+                    const exitAirport =
+                        airportPositions.at(-1);
+
+                    if (exitAirport) {
+
+                        const pos = getEDTOItemPosition(
+                            exitAirport.page,
+                            exitAirport.tokenIndex,
+                            exitAirport.value
+                        );
+
+                        if (pos) {
+
+                            edtoHighlights.push({
+                                ...exitAirport,
+                                role: "exit",
+                                ...pos
+                            });
+                        }
+                    }
+
+                    // START TIME
+                    if (startTimePosition) {
+
+                        const pos = getEDTOItemPosition(
+                            startTimePosition.page,
+                            startTimePosition.tokenIndex,
+                            startTimePosition.value
+                        );
+
+                        if (pos) {
+
+                            edtoHighlights.push({
+                                ...startTimePosition,
+                                role: "startTime",
+                                ...pos
+                            });
+                        }
+                    }
+
+                    // END TIME
+                    if (endTimePosition) {
+
+                        const pos = getEDTOItemPosition(
+                            endTimePosition.page,
+                            endTimePosition.tokenIndex,
+                            endTimePosition.value
+                        );
+
+                        if (pos) {
+
+                            edtoHighlights.push({
+                                ...endTimePosition,
+                                role: "endTime",
+                                ...pos
+                            });
+                        }
+                    }
+
                     edtoGroups.push({
                         airport1,
                         middleAirports,
                         airportLast,
                         start,
                         end,
-                        duration
+                        duration,
+
+                        debugTokens: {
+                            startTime: startTimePosition
+                                ? {
+                                    page: startTimePosition.page,
+                                    tokenIndex: startTimePosition.tokenIndex,
+                                    value: startTimePosition.value
+                                }
+                                : null,
+
+                            entryAirport: airport1Position
+                                ? {
+                                    page: airport1Position.page,
+                                    tokenIndex: airport1Position.tokenIndex,
+                                    value: airport1Position.value
+                                }
+                                : null,
+
+                            middleAirports: airportPositions.map(a => ({
+                                page: a.page,
+                                tokenIndex: a.tokenIndex,
+                                value: a.value
+                            })),
+
+                            exitAirport: airportLast
+                                ? airportPositions.at(-1)
+                                    ? {
+                                        page: airportPositions.at(-1).page,
+                                        tokenIndex: airportPositions.at(-1).tokenIndex,
+                                        value: airportPositions.at(-1).value
+                                    }
+                                    : null
+                                : null,
+
+                            endTime: endTimePosition
+                                ? {
+                                    page: endTimePosition.page,
+                                    tokenIndex: endTimePosition.tokenIndex,
+                                    value: endTimePosition.value
+                                }
+                                : null
+                        }
                     });
                 }
             }
         }
 
         window.edtoGroups = edtoGroups;
+        window.edtoHighlights = edtoHighlights;
+
+        console.table(
+            window.edtoHighlights.map((h, index) => ({
+                index,
+                page: h.page,
+                type: h.type,
+                value: h.value,
+                tokenIndex: h.tokenIndex,
+                itemIndex: h.itemIndex,
+                itemText:
+                    pages[h.page - 1]?.items[h.itemIndex]?.str
+            }))
+        );
     }
 
     ///FIRs
@@ -3661,10 +4112,21 @@ function resolveWeather(periods, time) {
 
 function resolveDestinationWeather(periods, time) {
 
-    let base = null;
     const overlays = [];
 
-    // STEP 1: ONLY FT is base candidate
+    // =====================================================
+    // 1. Find SA
+    // =====================================================
+
+    const sa = periods.find(
+        p => p.type === "SA"
+    ) || null;
+
+
+    // =====================================================
+    // 2. Find applicable FT
+    // =====================================================
+
     const ft = periods.find(p =>
         p.type === "FT" &&
         p.validFrom &&
@@ -3673,30 +4135,121 @@ function resolveDestinationWeather(periods, time) {
         time <= p.validTo
     ) || null;
 
-    base = ft || periods[0] || null;
+
+    // =====================================================
+    // 3. Find ALL FM groups that have started by arrival
+    //
+    // Example:
+    //
+    // FM280000
+    // FM281200
+    //
+    // If arrival is after 281200, BOTH are included.
+    //
+    // This is important because FM280000 may contain
+    // an explicit state change such as NSW.
+    // =====================================================
+
+    const applicableFMs = periods
+        .filter(p =>
+            p.type === "FM" &&
+            p.validFrom &&
+            time >= p.validFrom
+        )
+        .sort((a, b) =>
+            a.validFrom - b.validFrom
+        );
+
+
+    // =====================================================
+    // 4. Determine base
+    // =====================================================
+
+    const base =
+        ft ||
+        sa ||
+        periods[0] ||
+        null;
 
     if (!base)
         return null;
 
-    // STEP 2: overlays
-    for (const p of periods) {
 
-        if (p === base)
-            continue;
+    // =====================================================
+    // 5. Build chronological applicable weather sequence
+    //
+    // SA → FT → FM280000 → FM281200
+    //
+    // Later periods inherit anything they don't explicitly
+    // replace.
+    // =====================================================
 
-        if (p.validFrom && p.validTo) {
-            if (time >= p.validFrom && time <= p.validTo) {
-                overlays.push(p);
-            }
+    const all = [];
+
+    if (sa)
+        all.push(sa);
+
+    if (ft && ft !== sa)
+        all.push(ft);
+
+    for (const fm of applicableFMs) {
+        if (
+            fm !== sa &&
+            fm !== ft
+        ) {
+            all.push(fm);
         }
     }
 
-    const baseCloud = getCloudBase(base);
+
+    // =====================================================
+    // 6. Add applicable TEMPO / INTER / PROB groups
+    // =====================================================
+
+    for (const p of periods) {
+
+        if (
+            p.type !== "TEMPO" &&
+            p.type !== "INTER" &&
+            p.type !== "PROB30" &&
+            p.type !== "PROB40"
+        ) {
+            continue;
+        }
+
+        if (
+            p.validFrom &&
+            p.validTo &&
+            time >= p.validFrom &&
+            time <= p.validTo
+        ) {
+            all.push(p);
+        }
+    }
+
+
+    // =====================================================
+    // 7. Cloud base
+    // =====================================================
+
+    const finalPeriod =
+        all.length
+            ? all[all.length - 1]
+            : base;
+
+    const baseCloud =
+        getCloudBase(finalPeriod);
+
 
     return {
         base,
-        overlays,
-        all: [base, ...overlays],
+
+        overlays: all.filter(
+            p => p !== base
+        ),
+
+        all,
+
         cloudBase: baseCloud
     };
 }
@@ -3712,16 +4265,20 @@ function parseWeather(raw, baseDate) {
         "TEMPO",
         "INTER",
         "BECMG",
-        "FM",
         "PROB30",
         "PROB40"
     ];
 
     const WEATHER_CODES = new Set([
+
         "RA","DZ","SHRA","SHDZ","+RA","+SHRA","-RA","-SHRA",
+
         "TS","TSRA","+TSRA","-TSRA","VCTS",
+
         "SN","SHSN","SG","PL","GR","GS","FZRA","FZDZ",
+
         "FG","BR","HZ","FU","DU","SA","VA",
+
         "SQ","FC","+FC","PO","DS","SS","NSW"
     ]);
 
@@ -3734,64 +4291,130 @@ function parseWeather(raw, baseDate) {
 
     let current = null;
 
+
     function finishCurrent() {
+
         if (current) {
             periods.push(current);
         }
     }
 
-    for (const token of tokens) {
 
+    for (const token of tokens) {
         //----------------------------------
         // New forecast group
         //----------------------------------
+
+        // Normal groups
         if (GROUP_STARTS.includes(token)) {
 
             finishCurrent();
 
             current = {
+
                 type: token,
+
                 issue: null,
+
                 validFrom: null,
                 validTo: null,
+
                 validFromText: null,
                 validToText: null,
+
                 wind: null,
                 visibility: null,
                 pressure: null,
                 temperature: null,
+
                 clouds: [],
                 weather: [],
                 other: [],
+
                 raw: token
             };
 
             continue;
         }
 
+
+        //----------------------------------
+        // FMxxxxxx forecast group
+        //----------------------------------
+
+        if (/^FM\d{6}$/.test(token)) {
+
+            finishCurrent();
+
+            const fmTime = token.slice(2);
+
+            current = {
+
+                type: "FM",
+
+                issue: null,
+
+                validFrom: null,
+                validTo: null,
+
+                validFromText: fmTime,
+                validToText: null,
+
+                wind: null,
+                visibility: null,
+                pressure: null,
+                temperature: null,
+
+                clouds: [],
+                weather: [],
+                other: [],
+
+                raw: token
+            };
+
+
+            // FM time becomes the start of this forecast
+            current.validFrom =
+                makeWeatherDate(baseDate, fmTime);
+
+
+            continue;
+        }
+
+
         if (!current)
             continue;
 
+
         current.raw += " " + token;
+
 
         if (token === "=")
             continue;
 
+
         //----------------------------------
         // Issue time
         //----------------------------------
+
         if (
             current.issue === null &&
             /^\d{6}$/.test(token)
         ) {
+
             current.issueText = token;
-            current.issue = makeWeatherDate(baseDate, token);
+
+            current.issue =
+                makeWeatherDate(baseDate, token);
+
             continue;
         }
+
 
         //----------------------------------
         // Validity
         //----------------------------------
+
         if (/^\d{4}\/\d{4}$/.test(token)) {
 
             const [from, to] = token.split("/");
@@ -3799,50 +4422,118 @@ function parseWeather(raw, baseDate) {
             current.validFromText = from;
             current.validToText = to;
 
-            current.validFrom = makeWeatherDate(baseDate, from);
-            current.validTo = makeWeatherDate(baseDate, to);
+            current.validFrom =
+                makeWeatherDate(baseDate, from);
+
+            current.validTo =
+                makeWeatherDate(baseDate, to);
+
 
             if (current.validTo < current.validFrom) {
+
                 current.validTo.setUTCMonth(
                     current.validTo.getUTCMonth() + 1
                 );
             }
+
             continue;
         }
+
 
         //----------------------------------
         // Wind
         //----------------------------------
+
         if (/KT$|MPS$/.test(token)) {
             current.wind = token;
             continue;
         }
 
+
         //----------------------------------
-        // Visibility (FIXED)
+        // Visibility
         //----------------------------------
+
+        // CAVOK
         if (token === "CAVOK") {
             current.visibility = "CAVOK";
             continue;
         }
 
+
+        // Visibility in metres
         if (/^\d{4}$/.test(token)) {
             current.visibility = token;
             continue;
         }
 
-        const visMatch = token.match(/\b\d{4}\b/);
-        if (visMatch && !current.visibility) {
-            current.visibility = visMatch[0];
+
+        // Visibility in statute miles
+        if (/^(?:\d{1,2}|P\d)SM$/.test(token)) {
+            current.visibility = token;
+            continue;
         }
+
+
+        // Fractional statute-mile visibility
+        if (/^\d+\/\d+SM$/.test(token)) {
+            current.visibility = token;
+            continue;
+        }
+
+
+        // Combined visibility such as:
+        if (/^\d+\/\d+SM$/.test(token)) {
+
+            const previous =
+                current.raw.trim().split(/\s+/);
+
+            const prevToken =
+                previous.length >= 2
+                    ? previous[previous.length - 2]
+                    : null;
+
+            if (prevToken && /^\d+$/.test(prevToken)) {
+
+                current.visibility =
+                    `${prevToken} ${token}`;
+
+            } else {
+                current.visibility = token;
+            }
+
+            continue;
+        }
+
+
+        // Visibility embedded inside another token
+
+        const visMatch =
+            token.match(/\b\d{4}\b/);
+
+        if (
+            visMatch &&
+            !current.visibility
+        ) {
+
+            current.visibility =
+                visMatch[0];
+        }
+
 
         //----------------------------------
         // Pressure
         //----------------------------------
-        if (/^Q\d{4}$/.test(token)) {
+        if (
+            /^Q\d{4}$/.test(token) ||
+            /^A\d{4}$/.test(token)
+        ) {
+
             current.pressure = token;
+
             continue;
         }
+
 
         //----------------------------------
         // Temperature / Dewpoint
@@ -3852,29 +4543,48 @@ function parseWeather(raw, baseDate) {
             continue;
         }
 
+
         //----------------------------------
         // Clouds
         //----------------------------------
-        if (/^(FEW|SCT|BKN|OVC|VV)/.test(token)) {
+
+        if (
+            /^(FEW|SCT|BKN|OVC|VV)/.test(token)
+        ) {
+
             current.clouds.push(token);
+
             continue;
         }
+
 
         //----------------------------------
         // Weather phenomena
         //----------------------------------
+
         if (WEATHER_CODES.has(token)) {
+
             current.weather.push(token);
+
             continue;
         }
+
+
+        //----------------------------------
+        // Everything else
+        //----------------------------------
 
         current.other.push(token);
     }
 
+
     finishCurrent();
 
+
     console.log("TOKENS:", tokens);
+
     console.log("PARSED:", periods);
+
 
     return periods;
 }
@@ -3932,7 +4642,7 @@ function getApplicableForecast(periods, flightTime) {
     return { base, overlays };
 }
 
-///VIS ANALYSIS (FIXED CAVOK LOGIC)
+/// VIS ANALYSIS
 function analyseVisibility(applicable) {
 
     const alerts = [];
@@ -3950,7 +4660,11 @@ function analyseVisibility(applicable) {
         if (!period.visibility)
             continue;
 
-        const vis = period.visibility;
+        const vis = period.visibility.trim();
+
+        // =====================================================
+        // CAVOK
+        // =====================================================
 
         if (vis === "CAVOK") {
             alerts.push({
@@ -3962,6 +4676,67 @@ function analyseVisibility(applicable) {
             });
             continue;
         }
+
+
+        // =====================================================
+        // STATUTE MILES
+        //
+        // Only alert when reported visibility is < 1 SM.
+        //
+        // Examples:
+        // 1/2SM  → 0.5 SM → alert
+        // 3/4SM  → 0.75 SM → alert
+        // 1SM    → no alert
+        // 2SM    → no alert
+        // =====================================================
+
+        const smMatch = vis.match(
+            /^(\d+)\/(\d+)SM$/
+        );
+
+        if (smMatch) {
+
+            const numerator =
+                parseInt(smMatch[1], 10);
+
+            const denominator =
+                parseInt(smMatch[2], 10);
+
+            if (
+                denominator > 0 &&
+                numerator / denominator < 1
+            ) {
+                const smValue =
+                    numerator / denominator;
+
+                alerts.push({
+                    type: "visibility",
+                    severity: "warning",
+                    value: smValue,
+                    source: period.type,
+                    text: `Visibility ${vis}`
+                });
+            }
+
+            continue;
+        }
+
+
+        // Whole-number SM
+        //
+        // 1SM, 2SM, 7SM etc.
+        // Nothing below 1 SM here,
+        // so no alert is required.
+        //
+
+        if (/^\d+SM$/.test(vis)) {
+            continue;
+        }
+
+
+        // =====================================================
+        // METRES
+        // =====================================================
 
         const numVis = parseInt(vis, 10);
 
@@ -4357,7 +5132,7 @@ function analyseThunderstorms(period) {
 }
 
 
-///PRESSURE ANALYSIS
+/// PRESSURE ANALYSIS
 function analysePressure(period, phase) {
 
     const alerts = [];
@@ -4365,10 +5140,37 @@ function analysePressure(period, phase) {
     if (!period || !period.pressure)
         return alerts;
 
-    const qnh = parseInt(period.pressure.replace("Q", ""), 10);
+    const pressureToken = period.pressure;
 
-    if (isNaN(qnh))
+    let qnh = null;
+    let pressureDisplay = pressureToken;
+
+    // -------------------
+    // QNH in hPa
+    // -------------------
+    if (/^Q\d{4}$/.test(pressureToken)) {
+
+        qnh = Number(pressureToken.slice(1));
+
+    }
+
+    // -------------------
+    // Altimeter in inHg
+    // -------------------
+    else if (/^A\d{4}$/.test(pressureToken)) {
+
+        const inHg = Number(pressureToken.slice(1)) / 100;
+
+        // Convert inHg to hPa
+        qnh = Math.round(inHg * 33.8639);
+
+        pressureDisplay =
+            `${inHg.toFixed(2)} inHg`;
+    }
+
+    else {
         return alerts;
+    }
 
     // -------------------
     // High pressure
@@ -4377,7 +5179,7 @@ function analysePressure(period, phase) {
 
         alerts.push({
             severity: "caution",
-            text: `High pressure (QNH ${qnh})`
+            text: `High pressure (${pressureDisplay})`
         });
     }
 
@@ -4388,14 +5190,14 @@ function analysePressure(period, phase) {
 
         alerts.push({
             severity: "caution",
-            text: `Low pressure (QNH ${qnh})`
+            text: `Low pressure (${pressureDisplay})`
         });
     }
 
     // -------------------
     // Transition pressure change
     // -------------------
-    const delta = (qnh - 1013) * 27;   // signed altitude difference (ft)
+    const delta = Math.round((qnh - 1013) * 27);
 
     if (delta !== 0) {
 
@@ -4504,8 +5306,6 @@ const destApplicable = resolveDestinationWeather(destinationForecast, arrDateTim
 const depVis = analyseVisibility(depApplicable);
 const destVis = analyseVisibility(destApplicable);
 
-console.log("DEST APPLICABLE", destApplicable);
-
 const destCloud = destApplicable
     ? getCloudBase(destApplicable.base)
     : null;
@@ -4514,6 +5314,209 @@ const depCloud = depApplicable
     ? getCloudBase(depApplicable.base)
     : null;
 
+// =====================================================
+// WX EXTRACTION DEBUG
+// =====================================================
+
+console.log("========================================");
+console.log("           EXTRACTED WX");
+console.log("========================================");
+
+
+console.log("DEP WX:");
+
+if (depApplicable && depApplicable.base) {
+
+    const depBase = depApplicable.base;
+
+    console.log(
+        "Wind:",
+        depBase.wind || "N/A"
+    );
+
+    console.log(
+        "QNH:",
+        depBase.pressure || "N/A"
+    );
+
+    console.log(
+        "Visibility:",
+        depBase.visibility || "N/A"
+    );
+
+    console.log(
+        "Temperature:",
+        depBase.temperature || "N/A"
+    );
+
+    console.log(
+        "Clouds:",
+        depBase.clouds && depBase.clouds.length
+            ? depBase.clouds.join(" ")
+            : "N/A"
+    );
+
+    console.log(
+        "Weather:",
+        depBase.weather && depBase.weather.length
+            ? depBase.weather.join(" ")
+            : "N/A"
+    );
+
+    console.log(
+        "Other:",
+        depBase.other && depBase.other.length
+            ? depBase.other.join(" ")
+            : "N/A"
+    );
+
+} else {
+
+    console.log("No applicable departure WX found.");
+}
+
+
+console.log("----------------------------------------");
+
+console.log("ARR WX:");
+
+if (
+    destApplicable &&
+    destApplicable.all &&
+    destApplicable.all.length
+) {
+
+    // -------------------------------------------------
+    // Build final destination WX
+    // Each field uses the latest available value
+    // -------------------------------------------------
+
+    const destPeriods = destApplicable.all;
+
+    const finalDestWX = {
+        wind: null,
+        pressure: null,
+        visibility: null,
+        temperature: null,
+        clouds: [],
+        weather: [],
+        other: []
+    };
+
+    for (const period of destPeriods) {
+
+        // -----------------------------------------
+        // Scalar fields
+        // Keep previous value if this period
+        // does not provide a replacement.
+        // -----------------------------------------
+
+        if (period.wind) {
+            finalDestWX.wind = period.wind;
+        }
+
+        if (period.pressure) {
+            finalDestWX.pressure = period.pressure;
+        }
+
+        if (period.visibility) {
+            finalDestWX.visibility = period.visibility;
+        }
+
+        if (period.temperature) {
+            finalDestWX.temperature = period.temperature;
+        }
+
+
+        // -----------------------------------------
+        // Clouds
+        // -----------------------------------------
+
+        if (
+            period.clouds &&
+            period.clouds.length > 0
+        ) {
+            finalDestWX.clouds = [...period.clouds];
+        }
+
+
+        // -----------------------------------------
+        // Weather
+        // -----------------------------------------
+
+        if (
+            period.weather &&
+            period.weather.length > 0
+        ) {
+            finalDestWX.weather = [...period.weather];
+        }
+
+
+        // -----------------------------------------
+        // Other
+        // -----------------------------------------
+
+        if (
+            period.other &&
+            period.other.length > 0
+        ) {
+            finalDestWX.other = [...period.other];
+        }
+    }
+
+
+    // -------------------------------------------------
+    // Display final destination WX
+    // -------------------------------------------------
+
+    console.log(
+        "Wind:",
+        finalDestWX.wind || "N/A"
+    );
+
+    console.log(
+        "QNH:",
+        finalDestWX.pressure || "N/A"
+    );
+
+    console.log(
+        "Visibility:",
+        finalDestWX.visibility || "N/A"
+    );
+
+    console.log(
+        "Temperature:",
+        finalDestWX.temperature || "N/A"
+    );
+
+    console.log(
+        "Clouds:",
+        finalDestWX.clouds.length
+            ? finalDestWX.clouds.join(" ")
+            : "N/A"
+    );
+
+    console.log(
+        "Weather:",
+        finalDestWX.weather.length
+            ? finalDestWX.weather.join(" ")
+            : "N/A"
+    );
+
+    console.log(
+        "Other:",
+        finalDestWX.other.length
+            ? finalDestWX.other.join(" ")
+            : "N/A"
+    );
+
+
+} else {
+
+    console.log("No applicable destination WX found.");
+}
+
+console.log("========================================");
 
 // ---------------- DEPARTURE ANALYSIS ----------------
 
@@ -4764,12 +5767,12 @@ async function extractHighGroundWaypoints(ofpFile){
             !waypoints.includes(previousWaypoint)
         ){
 
-            console.log(
-                "Inserted",
-                previousWaypoint,
-                "before",
-                currentWaypoint
-            );
+            ///console.log(
+                ///"Inserted",
+                ///previousWaypoint,
+                ///"before",
+                ///currentWaypoint
+            ///);
 
             waypoints.splice(k,0,previousWaypoint);
 
@@ -4875,12 +5878,6 @@ async function findDecompressionProfiles(highGroundWaypoints, airways){
         });
 
     }
-
-    console.log(
-        "Decompression profile pages extracted:",
-        decompressionPages.length
-    );
-
 
     /// HELPERS
     function profileBaseName(profile){
@@ -5309,6 +6306,60 @@ async function findDecompressionProfiles(highGroundWaypoints, airways){
         );
 
     }
+
+    //--------------------------------------------------
+    // REMOVE REVERSE-DIRECTION DUPLICATES
+    //
+    // Treat:
+    //   A TO B
+    //   B TO A
+    //
+    // as the same route.
+    // Keep the first instance encountered.
+    //--------------------------------------------------
+
+    const uniqueRouteMatches = [];
+    const seenRoutePairs = new Set();
+
+    for (const match of filteredMatches) {
+
+        if (!match.route) {
+            uniqueRouteMatches.push(match);
+            continue;
+        }
+
+        const routeParts =
+            match.route
+                .split(/\s+TO\s+/i)
+                .map(x => x.trim());
+
+        // Only apply this filter to routes
+        // that contain exactly two endpoints.
+        if (routeParts.length !== 2) {
+            uniqueRouteMatches.push(match);
+            continue;
+        }
+
+        const from = routeParts[0];
+        const to = routeParts[1];
+
+        // Same pair regardless of direction.
+        const routeKey =
+            [from, to]
+                .sort()
+                .join(" TO ");
+
+        if (seenRoutePairs.has(routeKey)) {
+            continue;
+        }
+
+        seenRoutePairs.add(routeKey);
+
+        uniqueRouteMatches.push(match);
+    }
+
+    filteredMatches.length = 0;
+    filteredMatches.push(...uniqueRouteMatches);
 
     //--------------------------------------------------
     // FILTER 2 - PROFILE NAME / HIGH GROUND WAYPOINT
@@ -5849,6 +6900,7 @@ for (let i = 0; i < pagesToRender.length; i++) {
             if (pageNum === 1) {
                 if (upper.startsWith("PLAN")) {
                     planNumber = str;
+                    window.planNumber = str;
 
                     const t = item.transform;
 
@@ -5874,8 +6926,6 @@ for (let i = 0; i < pagesToRender.length; i++) {
                         width: textWidth,
                         height: textHeight
                     };
-
-                    console.log(item.transform);
 
                     octx.restore();
                 }
@@ -6141,6 +7191,7 @@ for (let i = 0; i < pagesToRender.length; i++) {
                     octx.fillRect(tx, ty - 10, width, 15);
 
                     burnoffTime = burnTime;
+                    window.burnoffTime = burnTime;
                 }
             }
             ///Burn-off
@@ -6626,7 +7677,7 @@ for (let i = 0; i < pagesToRender.length; i++) {
                 if (rtow !== null) {
                     rtowAnnotation = {
                         page: 0,
-                        text: `RTOW ${rtow}`,
+                        text: `RTOW ${rtowDisplay}`,
                         // Preview: tx + 71, ty + 18.
                         x: t[4] + (71 / scale),
                         y: t[5] - (18 / scale)
@@ -6636,7 +7687,7 @@ for (let i = 0; i < pagesToRender.length; i++) {
                     octx.font = "12px Helvetica";
 
                     octx.fillText(
-                        `RTOW ${rtow}`,
+                        `RTOW ${rtowDisplay}`,
                         tx + 71,
                         ty + 18
                     );
@@ -6667,8 +7718,6 @@ for (let i = 0; i < pagesToRender.length; i++) {
         }
             ///BURN ADD/LESS
                 if (upper.includes("BURN ADD") || upper.includes("BURN LESS")) {
-
-                    console.log("Found", upper, "on page", pageNum);
                     
                     const targetItem = items[i + 2];
 
@@ -6805,8 +7854,6 @@ for (let i = 0; i < pagesToRender.length; i++) {
                 pageNum <= airportWxEndPage &&
                 waypoints.length > 0
             ) {
-
-                console.log("PROCESSING WX PAGE:", pageNum);
 
                 const token = (item.str || "").trim().toUpperCase();
 
@@ -7184,8 +8231,26 @@ for (let i = 0; i < pagesToRender.length; i++) {
             if (
                 forecastStartPage !== null &&
                 pageNum >= forecastStartPage &&
-                pageNum <= forecastStartPage + 2
+                pageNum <= forecastStartPage + 4
             ) {
+
+            function parseForecastWind(windToken) {
+
+                if (!/^\d{5}$/.test(windToken)) {
+                    return null;
+                }
+
+                const direction =
+                    Number(windToken.slice(0, 2) + "0");
+
+                const speed =
+                    Number(windToken.slice(2));
+
+                return {
+                    direction,
+                    speed
+                };
+            }
 
                 const token = (item.str || "").trim().toUpperCase();
 
@@ -7298,10 +8363,10 @@ for (let i = 0; i < pagesToRender.length; i++) {
                     }
 
                     const windDir =
-                        Number(windToken.slice(0, 3));
+                        Number(windToken.slice(0, 2) + "0");
 
                     const windSpd =
-                        Number(windToken.slice(3));
+                        Number(windToken.slice(2));
 
 
                     // =================================================
@@ -7337,10 +8402,10 @@ for (let i = 0; i < pagesToRender.length; i++) {
                             fields[idx - 2];
 
                         const aboveDir =
-                            Number(aboveWind.slice(0, 3));
+                            Number(aboveWind.slice(0, 2) + "0");
 
                         const aboveSpd =
-                            Number(aboveWind.slice(3));
+                            Number(aboveWind.slice(2));
 
                         aboveComponent =
                             windComponent(
@@ -7372,10 +8437,10 @@ for (let i = 0; i < pagesToRender.length; i++) {
                             fields[idx + 4];
 
                         const belowDir =
-                            Number(belowWind.slice(0, 3));
+                            Number(belowWind.slice(0, 2) + "0");
 
                         const belowSpd =
-                            Number(belowWind.slice(3));
+                            Number(belowWind.slice(2));
 
                         belowComponent =
                             windComponent(
@@ -7617,10 +8682,10 @@ for (let i = 0; i < pagesToRender.length; i++) {
                     if (levelRecommendation) {
 
                         const levelRecY =
-                            fy + 13;
+                            fy ;
 
                         const levelRecX =
-                            recX + 55;
+                            recX + 60;
 
                         octx.font = "10px Helvetica";
                         octx.fillStyle = "blue";
@@ -7654,23 +8719,106 @@ for (let i = 0; i < pagesToRender.length; i++) {
                             page: pageNum - 1,
                             text: levelRecommendation,
                             x: tf[4] + items[j].width + 85,
-                            y: tf[5] - 10,
+                            y: tf[5],
                             color: PDFLib.rgb(0, 0, 1)
                         });
                     }
 
 
                     console.log(
-                        `FORECAST WIND | ${waypoint} | FL${flightLevel} | TRK ${track} | WIND ${windToken} | ${windComponentValue.toFixed(1)}KT | ABOVE FL${aboveFL} ${aboveWind} ${aboveComponent !== null ? aboveComponent.toFixed(1) : "N/A"} | BELOW FL${belowFL} ${belowWind} ${belowComponent !== null ? belowComponent.toFixed(1) : "N/A"} | ${recommendation} | ${levelRecommendation || "NO LEVEL CHANGE"} | CLB: ${isClbWaypoint}`
+                        `FORECAST WIND | ${waypoint} | ` +
+                        `CURRENT FL${flightLevel} | ` +
+                        `TRK ${track} | ` +
+                        `WIND ${windToken} | ` +
+                        `CURRENT ${windComponentValue.toFixed(1)}KT ` +
+                        `${windComponentValue > 0 ? "HW" : windComponentValue < 0 ? "TW" : "HW/TW"} | ` +
+                        `RECOMMENDATION: ${levelRecommendation || "NO LEVEL CHANGE"} | ` +
+                        `LEVEL DIFF: ${
+                            levelRecommendation
+                                ? (
+                                    climbImprovement >= 15 &&
+                                    climbImprovement >= descentImprovement
+                                        ? climbImprovement
+                                        : descentImprovement
+                                ).toFixed(1)
+                                : "N/A"
+                        }KT | ` +
+                        `ABOVE FL${aboveFL || "N/A"} ` +
+                        `${aboveWind || "N/A"} ` +
+                        `${aboveComponent !== null ? aboveComponent.toFixed(1) + "KT" : "N/A"} | ` +
+                        `BELOW FL${belowFL || "N/A"} ` +
+                        `${belowWind || "N/A"} ` +
+                        `${belowComponent !== null ? belowComponent.toFixed(1) + "KT" : "N/A"} | ` +
+                        `CLB: ${isClbWaypoint}`
                     );
 
                     break;
                 }
             }
-            ///NEXT
 
+            //--------------------------------------------------
+            // EDTO AIRPORTS + TIMINGS HIGHLIGHT
+            //--------------------------------------------------
 
+            if (
+                window.edtoHighlights &&
+                window.edtoHighlights.length
+            ) {
 
+                const highlight =
+                    window.edtoHighlights.find(h =>
+                        h.page === pageNum &&
+                        h.itemIndex === i
+                    );
+
+                if (highlight) {
+
+                    const t = item.transform;
+
+                    const tx =
+                        highlight.x * scale;
+
+                    const ty =
+                        viewport.height -
+                        (t[5] * scale);
+
+                    const highlightX =
+                        tx;
+
+                    const highlightY =
+                        ty - (item.height * scale) + 4;
+
+                    const highlightWidth =
+                        highlight.width * scale;
+
+                    const highlightHeight =
+                        item.height * scale;
+
+                    octx.save();
+
+                    octx.fillStyle =
+                        "rgba(255, 235, 59, 0.5)";
+
+                    octx.fillRect(
+                        highlightX,
+                        highlightY,
+                        highlightWidth,
+                        highlightHeight
+                    );
+
+                    octx.restore();
+
+                    edtoPdfHighlights.push({
+                        page: pageNum - 1,
+                        x: highlightX,
+                        y: highlightY,
+                        width: highlightWidth,
+                        height: highlightHeight
+                    });
+                }
+            }
+
+            /// NEXT
         }
 
 
@@ -7728,9 +8876,6 @@ for (let i = 0; i < pagesToRender.length; i++) {
             lines.push("CLB SCHED:");
 
             for (const m of clbMatches) {
-
-                console.log(m);
-
                 lines.push(
                     `FL${m.code} : ${m.value} ${m.waypointBefore}`
                 );
@@ -9629,6 +10774,9 @@ document.getElementById("downloadBtn").addEventListener("click", async () => {
         pagesToKeep.push(atcFlightPlanPage - 1);
     }
 
+    // REMOVE DUPLICATE PAGES
+    const uniquePagesToKeep = [...new Set(pagesToKeep)];
+
     // Keep WX pages
     if (
         wxStartPage !== null &&
@@ -9881,11 +11029,57 @@ document.getElementById("downloadBtn").addEventListener("click", async () => {
         });
     }
 
+    //--------------------------------------------------
+    // EDTO PDF HIGHLIGHT
+    //--------------------------------------------------
+
+    for (const h of edtoPdfHighlights) {
+
+        const exportPageIndex =
+            pageMap[h.page];
+
+        if (exportPageIndex === undefined)
+            continue;
+
+        const page =
+            exportDoc.getPages()[exportPageIndex];
+
+        const scale = 1.5;
+
+        page.drawRectangle({
+
+            x:
+                h.x / scale,
+
+            y:
+                page.getHeight()
+                - ((h.y + h.height) / scale),
+
+            width:
+                h.width / scale,
+
+            height:
+                h.height / scale,
+
+            color:
+                PDFLib.rgb(
+                    1,
+                    0.92,
+                    0.2
+                ),
+
+            opacity:
+                0.45
+        });
+    }
+
     const bytes = await exportDoc.save();
+
+    const cleanPlanNumber = planNumber.match(/PLAN\s*(\d+)/i)?.[1] || "";
 
     const fileName =
         dep && arr && date
-            ? `${dep}${arr}${date}.pdf`
+            ? `${dep}${arr}${date} ${window.burnoffTime} ${cleanPlanNumber}.pdf`
             : "Annotated_OFP.pdf";
 
     const blob = new Blob([bytes], {

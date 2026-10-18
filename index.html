@@ -11613,7 +11613,7 @@ document.getElementById("downloadBtn").addEventListener("click", async () => {
 
     if (isIOS && navigator.canShare && navigator.canShare({ files: [file] })) {
         try {
-            await navigator.share({ files: [file], title: fileName });
+            await navigator.share({ files: [file] }); // files only: a title/text makes iOS add a second text item
             return;
         } catch (err) {
             // User closed the sheet: nothing more to do.

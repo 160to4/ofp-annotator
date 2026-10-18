@@ -1713,7 +1713,7 @@ function drawColourHighlight(page, h) {
 
     page.drawRectangle({
         x: h.transform[4],
-        y: h.transform[5],
+        y: h.transform[5] - 2,
         width: h.text.length * 6,
         height: 10,
         color: colour,
@@ -5642,10 +5642,22 @@ function buildWeatherLines(...groups) {
 }
 
 function isApplicableWeatherLine(line, applicable) {
-    const groups = [
+    let groups = [
         applicable.base,
         ...(applicable.overlays || [])
     ].filter(Boolean);
+
+    // If several FM groups have already started, only the latest
+    // one is highlighted (earlier FMs are superseded).
+    const fmGroups = groups.filter(g => g.type === "FM" && g.validFrom);
+
+    if (fmGroups.length > 1) {
+        const latestFM = fmGroups.reduce((a, b) =>
+            b.validFrom > a.validFrom ? b : a
+        );
+
+        groups = groups.filter(g => g.type !== "FM" || g === latestFM);
+    }
 
     return groups.some(g => line.includes(g.raw));
 }
@@ -5672,6 +5684,14 @@ const destWxLines = buildWeatherLines(
 //=====================================================
 // EXTRACT HIGH GROUND WAYPOINTS
 //=====================================================
+
+// True only if `airway` appears as a whole airway designator in `text`,
+// i.e. not as part of a longer one (M11 must not match inside UM11 or M110).
+function containsWholeAirway(text, airway){
+    const escaped = airway.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const re = new RegExp(`(^|[^A-Z0-9])${escaped}($|[^A-Z0-9])`);
+    return re.test(text);
+}
 
 async function extractHighGroundWaypoints(ofpFile){
     const seen = new Set();
@@ -6002,7 +6022,7 @@ async function findDecompressionProfiles(highGroundWaypoints, airways){
                 const matchedTokenAirways =
                     airways.filter(
                         airway =>
-                            currentToken.includes(airway)
+                            containsWholeAirway(currentToken, airway)
                     );
 
                 console.log(
@@ -6482,18 +6502,61 @@ async function findDecompressionProfiles(highGroundWaypoints, airways){
         uniqueMatches.push(match);
     }
 
-    //--------------------------------------------------
-    // FINAL RESULTS
-    //--------------------------------------------------
+        //--------------------------------------------------
+        // FILTER 4 - SINGLE "DCT" AIRWAY MATCH
+        //
+        // If a match has exactly one airway entry and that
+        // entry is a "DCT xxxx", only keep it when BOTH ends
+        // of the route are high-ground waypoints.
+        //--------------------------------------------------
 
-    console.log(
-        "FINAL UNIQUE DECOMPRESSION PROFILES:"
-    );
+        const filter4Matches = uniqueMatches.filter(match => {
+            const airwayEntries = (match.airway || "")
+                .split(",")
+                .map(x => x.trim())
+                .filter(Boolean);
 
-    console.log(uniqueMatches);
+            const isSingleDct =
+                airwayEntries.length === 1 &&
+                airwayEntries[0].startsWith("DCT ");
 
-    return uniqueMatches;
+            // Filter only applies to single-DCT matches
+            if(!isSingleDct)
+                return true;
 
+            const routeParts = match.route
+                .split(/\s+TO\s+/i)
+                .map(x => x.trim());
+
+            const bothHighGround =
+                routeParts.length === 2 &&
+                highGroundWaypointSet.has(routeParts[0]) &&
+                highGroundWaypointSet.has(routeParts[1]);
+
+            if(!bothHighGround){
+                console.log(
+                    "DCT FILTER REMOVED:",
+                    match.route,
+                    "→",
+                    match.profile
+                );
+            }
+
+            return bothHighGround;
+        });
+
+        //--------------------------------------------------
+        // FINAL RESULTS
+        //--------------------------------------------------
+
+        console.log(
+            "FINAL UNIQUE DECOMPRESSION PROFILES:"
+        );
+
+        console.log(filter4Matches);
+
+        return filter4Matches;
+        
     //--------------------------------------------------
     // FINAL RESULTS
     //--------------------------------------------------
@@ -6964,7 +7027,7 @@ for (let i = 0; i < pagesToRender.length; i++) {
 
             ///PLAN NUMBER
             if (pageNum <= 4 && !planNumber) {
-                if (upper.startsWith("PLAN")) {
+                if (upper.startsWith("PLAN ")) {
                     planNumber = str;
                     window.planNumber = str;
 
@@ -7620,7 +7683,7 @@ for (let i = 0; i < pagesToRender.length; i++) {
                             page: pageNum - 1,
                             text: converted,
                             x: t[4] + (110 / scale),
-                            y: t[5] - (1 / scale)
+                            y: t[5] + (1 / scale)
                         };
 
                         const tx = t[4] * scale;
@@ -7653,7 +7716,7 @@ for (let i = 0; i < pagesToRender.length; i++) {
                             page: pageNum - 1,
                             text: converted,
                             x: t[4] + (110 / scale),
-                            y: t[5] - (1 / scale)
+                            y: t[5] + (1 / scale)
                         };
 
                         const tx = t[4] * scale;
@@ -7685,7 +7748,7 @@ for (let i = 0; i < pagesToRender.length; i++) {
                             page: pageNum - 1,
                             text: converted,
                             x: t[4] + (110 / scale),
-                            y: t[5] - (1 / scale)
+                            y: t[5] + (1 / scale)
                         };
 
                         const tx = t[4] * scale;
@@ -7830,12 +7893,7 @@ for (let i = 0; i < pagesToRender.length; i++) {
                 if (colour) {
                     const t = item.transform;
 
-                    legsNumberHighlights.push({
-                        page: pageNum - 1,
-                        transform: t,
-                        text: token,
-                        colour: colour
-                    });
+
 
                     const tx = t[4] * scale;
                     const ty = viewport.height - (t[5] * scale);
@@ -7855,6 +7913,12 @@ for (let i = 0; i < pagesToRender.length; i++) {
                     );
 
                     octx.restore();
+                        legsNumberHighlights.push({
+                        page: pageNum - 1,
+                        transform: t,
+                        text: token,
+                        colour: colour
+                    });
                 }
             }
 
@@ -8762,11 +8826,6 @@ for (let i = 0; i < pagesToRender.length; i++) {
                         searchFrom = matchIndex + searchValue.length;
                     }
                 }
-            } else if (typeof str === "string" && i === 0) {
-                console.log("ATC HIGHLIGHT PAGE CHECK:", {
-                    pageNum,
-                    atcFlightPlanPage
-                });
             }
 
             // -----------------------------
@@ -10063,9 +10122,9 @@ for (let i = 0; i < pagesToRender.length; i++) {
 
                     octx.fillRect(
                         510 - 2,
-                        y - 10,
+                        y - 8,
                         width + 4,
-                        12
+                        9
                     );
                 }
 
@@ -10901,10 +10960,10 @@ document.getElementById("downloadBtn").addEventListener("click", async () => {
             if (line.highlight) {
                 page.drawRectangle({
                     x: weatherAnnotation.x / 1.5 - 2,
-                    y: y - 2,
+                    y: y - 1.5,
                     width:
                         (line.text.length * 5.5) / 1.5,
-                    height: 12,
+                    height: 7,
                     color: PDFLib.rgb(
                         1,
                         0.92,

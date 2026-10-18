@@ -47,6 +47,23 @@ canvas.pdfCanvas {
     z-index: 1;
 }
 
+#warnings {
+    display: none;
+    margin: 15px auto 0 auto;
+    max-width: 900px;
+    padding: 10px 16px;
+    background: #fff8e1;
+    border: 1px solid #ffb300;
+    border-radius: 4px;
+    font-size: 13px;
+    color: #5d4037;
+}
+
+#warnings ul {
+    margin: 6px 0 0 0;
+    padding-left: 20px;
+}
+
 canvas.overlayCanvas {
     position: absolute;
     top: 0;
@@ -60,13 +77,15 @@ canvas.overlayCanvas {
 <body>
 
 <div class="header">
-    <h2>OFP Annotation Tool v2.4</h2>
+    <h2>OFP Annotation Tool v2.5</h2>
 </div>
 
 <div class="upload">
     <input type="file" id="file" accept="application/pdf">
     <button id="downloadBtn">Download Annotated PDF</button>
 </div>
+
+<div id="warnings"></div>
 
 <div id="viewer"></div>
 
@@ -1923,6 +1942,7 @@ let blockTimeAnnotation = null;
 let vwsAnnotation = null;
 let netTimeAnnotation = null;
 let crewRestAnnotation = null;
+let extractionWarnings = [];
 let reservesAnnotation = null;
 let sidStarAnnotation = null;
 let highGroundAnnotation = null;
@@ -1934,6 +1954,7 @@ let windArrowAnnotation = null;
 let crewBulletinAnnotation = null;
 let pageTitleAnnotations = [];
 let notamHighlights = [];
+let notamExtraPages = [];
 let intamPdfAnnotations = [];
 const intamAgeAnnotations = [];
 let forecastWaypointHighlights = [];
@@ -2057,6 +2078,8 @@ function resetState() {
     vwsAnnotation = null;
     netTimeAnnotation = null;
     crewRestAnnotation = null;
+    extractionWarnings = [];
+    renderExtractionWarnings();
     reservesAnnotation = null;
     sidStarAnnotation = null;
     highGroundAnnotation = null;
@@ -2068,6 +2091,7 @@ function resetState() {
     crewBulletinAnnotation = null;
     pageTitleAnnotations = [];
     notamHighlights = [];
+    notamExtraPages = [];
     intamPdfAnnotations = [];
     intamAgeAnnotations.length = 0;
     forecastWaypointHighlights = [];
@@ -2145,6 +2169,40 @@ function resetState() {
     window.edtoHighlights = [];
     window.edtoPdfHighlights = [];
     window.edtoGroups = [];
+}
+
+///EXTRACTION WARNINGS
+// Collects anything the OFP layout may have broken, so a missing result
+// isn't mistaken for a genuinely empty one. Shown in a banner under the
+// upload bar (preview only - nothing is added to the PDF).
+function addExtractionWarning(message) {
+    if (!extractionWarnings.includes(message)) {
+        extractionWarnings.push(message);
+        console.warn("EXTRACTION WARNING:", message);
+    }
+}
+
+function renderExtractionWarnings() {
+    const box = document.getElementById("warnings");
+
+    if (!box) return;
+
+    if (!extractionWarnings.length) {
+        box.style.display = "none";
+        box.innerHTML = "";
+        return;
+    }
+
+    const items = extractionWarnings
+        .map(w => `<li>${w.replace(/&/g, "&amp;").replace(/</g, "&lt;")}</li>`)
+        .join("");
+
+    box.innerHTML =
+        `<strong>&#9888; ${extractionWarnings.length} extraction warning` +
+        `${extractionWarnings.length === 1 ? "" : "s"} - check these manually</strong>` +
+        `<ul>${items}</ul>`;
+
+    box.style.display = "block";
 }
 
 // Clicking "Choose file" wipes the previous OFP before the file dialog opens
@@ -3111,6 +3169,7 @@ fileInput.addEventListener("change", async (e) => {
                             edtoHighlights.push({
                                 ...airport1Position,
                                 role: "entry",
+                                duration: duration,
                                 ...pos
                             });
                         }
@@ -3761,7 +3820,10 @@ function daysSinceIntam(date) {
     return Math.floor((today - date) / (1000 * 60 * 60 * 24));
 }
 
-// Render from page 1 through the page containing the captain's approval
+// Render from page 1 through the page containing the captain's approval.
+// The FIR / weather / wind-arrow annotations are drawn on page 2, so page 2 must
+// ALWAYS be rendered - even when the summary fits on one page (e.g. short CGK-SIN
+// flights) and the approval line is on page 1 (no overflow page).
 const approvalPage = pages.find(pg =>
     pg.upperText.includes("APPROVED/ACCEPTED BY CAPT(SIGN)")
 )?.pageNumber;
@@ -3769,13 +3831,16 @@ const approvalPage = pages.find(pg =>
 const pagesToRender = [];
 
 if (approvalPage !== undefined) {
-    for (let p = 1; p <= approvalPage; p++) {
+    const lastSummaryPage = Math.min(Math.max(approvalPage, 2), pdf.numPages);
+    for (let p = 1; p <= lastSummaryPage; p++) {
         pagesToRender.push(p);
     }
 } else {
     // Fallback if the approval text cannot be found
-    console.warn("Captain approval text not found. Rendering page 1 only.");
-    pagesToRender.push(1);
+    console.warn("Captain approval text not found. Rendering pages 1-2.");
+    for (let p = 1; p <= Math.min(2, pdf.numPages); p++) {
+        pagesToRender.push(p);
+    }
 }
 
 console.log("Pages to render:", pagesToRender);
@@ -3840,6 +3905,203 @@ if (
         p <= notamEndPage;
         p++
     ) {
+        if (!pagesToRender.includes(p)) {
+            pagesToRender.push(p);
+        }
+    }
+}
+
+///NOTAM AIRWAY + KABUL (OAKX) PAGES
+// 1) Any airway from page 1 that appears inside an en-route NOTAM is
+//    highlighted, and that page is added to the preview + final PDF.
+// 2) The Kabul (OAKX) FIR NOTAM block is always added when the OFP has one.
+const airways = extractAirways();
+const notamAirwayHighlights = [];
+let notamAirwayTitlePage = null;   // first added page with an airway hit
+let notamKabulTitlePage = null;    // first page of the Kabul (OAKX) block
+
+if (airways.length === 0) {
+    addExtractionWarning(
+        "NOTAM airways: no airways found on page 1, so no airway NOTAM pages were added"
+    );
+}
+
+if (notamStartPage !== null) {
+    const baseEndPage = notamEndPage ?? notamStartPage;
+
+    // Last page of the NOTAM bulletin
+    let bulletinEndPage = null;
+
+    for (let p = notamStartPage; p <= pages.length; p++) {
+        if (pages[p - 1].upperText.includes("END OF LIDO-NOTAM-BULLETIN")) {
+            bulletinEndPage = p;
+            break;
+        }
+    }
+
+    if (bulletinEndPage === null) {
+        bulletinEndPage = crewBulletinStartPage !== null
+            ? crewBulletinStartPage - 1
+            : baseEndPage;
+    }
+
+    bulletinEndPage = Math.max(bulletinEndPage, baseEndPage);
+
+    // Flatten every non-empty text item in the bulletin, in reading order
+    const notamStream = [];
+
+    for (let p = notamStartPage; p <= bulletinEndPage; p++) {
+        for (const item of pages[p - 1].items) {
+            const s = (item.str || "").trim();
+
+            if (s) notamStream.push({ p, item, s });
+        }
+    }
+
+    const enrouteMarker = /^(EXTENDED AREA|AREA ENROUTE)/;
+    const enrouteMarkerFound = notamStream.some(e => enrouteMarker.test(e.s));
+
+    // ---- Airways inside en-route NOTAM entries ----
+    // Only text inside a NOTAM entry is searched (not the route printed at the
+    // top of the bulletin), and only the en-route part: airport NOTAMs
+    // mention taxiways/stands such as "A1" or "N8" that look like airways.
+    const airwayRegexes = airways.map(airway => ({
+        airway,
+        re: new RegExp(`(^|[^A-Z0-9])(${airway})(?![A-Z0-9])`, "g")
+    }));
+
+    const pagesWithAirways = new Set();
+    let inNotam = false;
+    let inEnroute = false;
+
+    for (let k = 0; k < notamStream.length; k++) {
+        const { p, item, s } = notamStream[k];
+
+        if (enrouteMarker.test(s)) inEnroute = true;
+
+        // Section lines / airport headers end the current NOTAM entry
+        if (/^[=+]{5,}/.test(s) || /^-{5,}$/.test(s)) {
+            inNotam = false;
+            continue;
+        }
+
+        // NOTAM entry header: "1A765/26" followed by "VALID: ..."
+        if (
+            /^[A-Z0-9]+\/\d+$/.test(s) &&
+            (notamStream[k + 1]?.s || "").startsWith("VALID:")
+        ) {
+            inNotam = true;
+            continue;
+        }
+
+        if (!inNotam) continue;
+
+        if (enrouteMarkerFound ? !inEnroute : p <= baseEndPage) continue;
+
+        const upper = item.str.toUpperCase();
+        const charWidth = item.width / item.str.length;
+        const viewportHeight = pages[p - 1].viewport.height;
+
+        for (const { airway, re } of airwayRegexes) {
+            re.lastIndex = 0;
+
+            let m;
+
+            while ((m = re.exec(upper)) !== null) {
+                const startIndex = m.index + m[1].length;
+
+                notamAirwayHighlights.push({
+                    page: p,
+                    airway,
+                    x: (item.transform[4] + startIndex * charWidth) * scale,
+                    y: viewportHeight - (item.transform[5] * scale),
+                    width: airway.length * charWidth * scale
+                });
+
+                pagesWithAirways.add(p);
+            }
+        }
+    }
+
+    // ---- Kabul (OAKX) FIR NOTAM block ----
+    // Each block header sits on the line above a dashed line.
+    const notamBlocks = [];
+
+    for (let k = 0; k < notamStream.length; k++) {
+        if (!/^-{5,}$/.test(notamStream[k].s)) continue;
+
+        let headerStart = k;
+
+        while (
+            headerStart - 1 >= 0 &&
+            notamStream[headerStart - 1].p === notamStream[k].p &&
+            notamStream[headerStart - 1].item.transform[5] > notamStream[k].item.transform[5] &&
+            notamStream[headerStart - 1].item.transform[5] - notamStream[k].item.transform[5] <= 16
+        ) {
+            headerStart--;
+        }
+
+        notamBlocks.push({
+            headerStart,
+            dashIndex: k,
+            text: notamStream.slice(headerStart, k).map(e => e.s).join(" ")
+        });
+    }
+
+    const kabulPages = new Set();
+
+    for (let b = 0; b < notamBlocks.length; b++) {
+        if (!/\bOAKX\b/.test(notamBlocks[b].text)) continue;
+
+        // The block runs until the next block header or "=====" section line
+        let boundary = notamStream.length;
+
+        if (b + 1 < notamBlocks.length) {
+            boundary = notamBlocks[b + 1].headerStart;
+        }
+
+        for (let k = notamBlocks[b].dashIndex + 1; k < boundary; k++) {
+            if (/^={5,}/.test(notamStream[k].s)) {
+                boundary = k;
+                break;
+            }
+        }
+
+        const firstPage = notamStream[notamBlocks[b].headerStart].p;
+        const lastPage = notamStream[
+            Math.max(boundary - 1, notamBlocks[b].headerStart)
+        ].p;
+
+        for (let p = firstPage; p <= lastPage; p++) {
+            kabulPages.add(p);
+        }
+
+        console.log(
+            `KABUL (OAKX) NOTAM BLOCK: pages ${firstPage}-${lastPage}`
+        );
+    }
+
+    // Pages up to the end of the destination-alternate section are already
+    // kept; only pages beyond it need to be added.
+    const extraPages = new Set();
+
+    for (const p of [...pagesWithAirways, ...kabulPages]) {
+        if (p > baseEndPage) extraPages.add(p);
+    }
+
+    notamExtraPages = [...extraPages].sort((a, b) => a - b);
+
+    notamAirwayTitlePage =
+        notamExtraPages.find(p => pagesWithAirways.has(p)) ?? null;
+
+    notamKabulTitlePage =
+        kabulPages.size ? Math.min(...kabulPages) : null;
+
+    console.log("NOTAM airway hits:", notamAirwayHighlights.map(h => `${h.airway}@p${h.page}`));
+    console.log("Kabul (OAKX) pages:", [...kabulPages]);
+    console.log("Extra NOTAM pages added:", notamExtraPages);
+
+    for (const p of notamExtraPages) {
         if (!pagesToRender.includes(p)) {
             pagesToRender.push(p);
         }
@@ -5699,6 +5961,10 @@ async function extractHighGroundWaypoints(ofpFile){
     // Keep every page's token list so we can search it later
     const pageWords = [];
 
+    // Terrain codes found vs. codes whose waypoint (17 tokens back) is readable
+    let terrainCodeCount = 0;
+    let unreadableTerrainCodes = 0;
+
     //--------------------------------------------------
     // PASS 1 - Extract all high ground waypoints
     //--------------------------------------------------
@@ -5717,6 +5983,12 @@ async function extractHighGroundWaypoints(ofpFile){
             if(/\d{3}\*\d{4}/.test(token)){
                 const waypoint = words[i - 17];
 
+                terrainCodeCount++;
+
+                if(!waypoint || !/^[A-Z0-9]{2,6}$/.test(waypoint)){
+                    unreadableTerrainCodes++;
+                }
+
                 if(
                     waypoint &&
                     /^[A-Z0-9]{2,6}$/.test(waypoint) &&
@@ -5727,6 +5999,13 @@ async function extractHighGroundWaypoints(ofpFile){
                 }
             }
         }
+    }
+
+    if(terrainCodeCount > 0 && unreadableTerrainCodes > 0){
+        addExtractionWarning(
+            `High ground: ${unreadableTerrainCodes} of ${terrainCodeCount} ` +
+            `terrain codes had no readable waypoint (the OFP layout may have changed)`
+        );
     }
 
     //--------------------------------------------------
@@ -6573,14 +6852,28 @@ async function findDecompressionProfiles(highGroundWaypoints, airways){
 const highGroundWaypoints =
     await extractHighGroundWaypoints(fileInput.files[0]);
 
-const airways =
-    extractAirways();
+let profiles = [];
 
-const profiles =
-    await findDecompressionProfiles(
-        highGroundWaypoints,
-        airways
+try {
+    profiles =
+        await findDecompressionProfiles(
+            highGroundWaypoints,
+            airways
+        );
+} catch (err) {
+    console.error("Decompression profile lookup failed:", err);
+
+    addExtractionWarning(
+        "Decompression profiles: could not load or read decompression_profiles.pdf"
     );
+}
+
+if (highGroundWaypoints.length > 0 && profiles.length === 0) {
+    addExtractionWarning(
+        `Decompression profiles: none matched for ${highGroundWaypoints.length} ` +
+        `high ground waypoint${highGroundWaypoints.length === 1 ? "" : "s"}`
+    );
+}
 
 console.log("High Ground Waypoints:", highGroundWaypoints);
 console.log("Airways:", airways);
@@ -6895,6 +7188,33 @@ for (let i = 0; i < pagesToRender.length; i++) {
             }
         }
 
+        // AIRWAYS FOUND IN NOTAMS - highlight (preview + final PDF)
+        for (const h of notamAirwayHighlights) {
+            if (h.page !== pageNum)
+                continue;
+
+            octx.save();
+
+            octx.fillStyle = "rgba(255,235,59,0.45)";
+
+            octx.fillRect(
+                h.x - 2,
+                h.y - 12,
+                h.width + 4,
+                18
+            );
+
+            octx.restore();
+
+            notamHighlights.push({
+                page: h.page - 1,
+                x: h.x,
+                y: h.y,
+                width: h.width,
+                height: 18
+            });
+        }
+
         // Only OFPs that mention NAT TRK / NAT TRACK on page 1 need the NAT checks
         if (hasNatTrack) {
             // -----------------------------
@@ -7026,7 +7346,10 @@ for (let i = 0; i < pagesToRender.length; i++) {
             }
 
             ///PLAN NUMBER
-            if (pageNum <= 4 && !planNumber) {
+            // Only look on page 1, and stop once found (planNumber is a per-page
+            // local, so guard with window.planNumber). Otherwise page 2's
+            // "PLAN TEMP P028 PLAN QNH ..." line gets picked up as the plan number.
+            if (pageNum === 1 && !window.planNumber) {
                 if (upper.startsWith("PLAN ")) {
                     planNumber = str;
                     window.planNumber = str;
@@ -7938,7 +8261,12 @@ for (let i = 0; i < pagesToRender.length; i++) {
                 // CHECK IF THIS IS THE START OF A NEW AIRPORT
                 //--------------------------------------------------
 
-                const airportMatch = token.match(/\b([A-Z]{4})\//);
+                // The header item starts with "ICAO/IATA" (e.g. KJFK/JFK).
+                // Anchored so a name item such as "NEW YORK/JOHN F KENNEDY INTL"
+                // can't match "YORK/" as if it were an airport code.
+                const airportMatch = token.match(
+                    /^\s*([A-Z]{4})\/[A-Z0-9]{3}(?![A-Z0-9])/
+                );
 
                 const matchedAirport = airportMatch
                     ? airportMatch[1]
@@ -8674,6 +9002,36 @@ for (let i = 0; i < pagesToRender.length; i++) {
                         width: highlightWidth,
                         height: highlightHeight
                     });
+
+                    // SEGMENT TIME - drawn at the entry airport's line
+                    // EDTO_SEGMENT_TIME_X = canvas px from the left edge (adjust here)
+                    if (
+                        highlight.role === "entry" &&
+                        highlight.duration &&
+                        highlight.duration !== "-"
+                    ) {
+                        const EDTO_SEGMENT_TIME_X = 15;
+
+                        octx.save();
+
+                        octx.fillStyle = "blue";
+                        octx.font = "10px Helvetica";
+
+                        octx.fillText(
+                            highlight.duration,
+                            EDTO_SEGMENT_TIME_X,
+                            ty
+                        );
+
+                        octx.restore();
+
+                        edtoPdfHighlights.push({
+                            page: pageNum - 1,
+                            text: highlight.duration,
+                            x: EDTO_SEGMENT_TIME_X,
+                            y: ty
+                        });
+                    }
                 }
             }
 
@@ -10423,13 +10781,29 @@ for (let i = 0; i < pagesToRender.length; i++) {
         `${(window.burnoffTime || "").replace(".", ":")} ` +
         `${window.aircraftRegistration || ""}`;
 
+    // Added NOTAM pages: if the first airway page is also the first Kabul
+    // page, one combined title is used so two titles don't overlap.
+    const sameNotamTitlePage =
+        notamAirwayTitlePage !== null &&
+        notamAirwayTitlePage === notamKabulTitlePage;
+
     const titles = [
         [1,                   planTitle],
         [atcFlightPlanPage,   "ATC FLIGHT PLAN"],
         [sidPage,             "ROUTE LEGS"],
         [edtoStartPage,       "EDTO INFORMATION"],
         [airportWxStartPage,  "WEATHER/TAF"],
-        [notamStartPage,      "NOTAMS DEP/ARR"]
+        [notamStartPage,      "NOTAMS DEP/ARR"],
+        [
+            notamAirwayTitlePage,
+            sameNotamTitlePage
+                ? "NOTAMS - AIRWAYS / KABUL (OAKX)"
+                : "NOTAMS - AIRWAYS"
+        ],
+        [
+            sameNotamTitlePage ? null : notamKabulTitlePage,
+            "NOTAMS - KABUL (OAKX)"
+        ]
     ];
 
     for (const [pageNum, text] of titles) {
@@ -10439,6 +10813,71 @@ for (let i = 0; i < pagesToRender.length; i++) {
 
     // INTAMS title (first bulletin page only)
     intamTitleAnnotation = addPageTitle(crewBulletinStartPage, "INTAMS");
+
+    ///EXTRACTION CHECKS
+    // Pages located by searching for fixed text
+    const pageChecks = [
+        [sidPage,              'Legs start page ("SID TOTAL DIST:")'],
+        [starPage,             'Legs end page ("STAR TOTAL DIST:")'],
+        [forecastStartPage,    'Forecast winds page ("FORECAST WIND -")'],
+        [atcFlightPlanPage,    'ATC Flight Plan page'],
+        [airportWxStartPage,   'Airport WX list start ("AIRPORT WX LIST")'],
+        [airportWxEndPage,     'Airport WX list end ("AIRPORTLIST ENDED")'],
+        [notamStartPage,       'Departure NOTAMs page'],
+        [notamDestPage,        'Destination NOTAMs page'],
+        [crewBulletinStartPage,'Crew bulletin (INTAMS) page'],
+        [weatherChartsPage,    'Weather charts page ("SECURITY STATUS")']
+    ];
+
+    for (const [value, label] of pageChecks) {
+        if (value === null || value === undefined) {
+            addExtractionWarning(`Page not found: ${label}`);
+        }
+    }
+
+    // Values read from the OFP and the results calculated from them
+    const valueChecks = [
+        [dep,                         'Departure airport'],
+        [arr,                         'Arrival airport'],
+        [date,                        'Flight date'],
+        [window.planNumber,           'Plan number'],
+        [window.burnoffTime,          'Burn-off time'],
+        [window.aircraftRegistration, 'Aircraft registration'],
+        [burnoffAnnotation,           'Burn-off fuel'],
+        [contingencyAnnotation,       'Contingency fuel'],
+        [alternateFuelAnnotation,     'Alternate fuel'],
+        [taxiFuelAnnotation,          'Taxi fuel'],
+        [landingFuelAnnotation,       'Landing fuel'],
+        [pzfwAnnotation,              'PZFW'],
+        [ptowAnnotation,              'PTOW'],
+        [plwtAnnotation,              'PLWT'],
+        [blockTimeAnnotation,         'Block time (dep/arr times)'],
+        [netTimeAnnotation,           'Net time (block time vs burn-off)'],
+        [weatherAnnotation,           'Weather analysis (page 2)']
+    ];
+
+    for (const [value, label] of valueChecks) {
+        if (!value) {
+            addExtractionWarning(`Not found: ${label}`);
+        }
+    }
+
+    // EDTO page present but nothing read from it
+    if (edtoStartPage !== null) {
+        if (edtoEndPage === null) {
+            addExtractionWarning(
+                'EDTO: start page found but no "EDTO ENROUTE ALTN AIRPORTS:" end page'
+            );
+        }
+
+        if (!window.edtoGroups || window.edtoGroups.length === 0) {
+            addExtractionWarning(
+                "EDTO: page found but no EDTO segments could be read"
+            );
+        }
+    }
+
+    renderExtractionWarnings();
 });
 
 document.getElementById("downloadBtn").addEventListener("click", async () => {
@@ -11372,6 +11811,11 @@ document.getElementById("downloadBtn").addEventListener("click", async () => {
         }
     }
 
+    // Keep extra NOTAM pages (airways found in NOTAMs + Kabul OAKX)
+    for (const p of notamExtraPages) {
+        pagesToKeep.push(p - 1);
+    }
+
     // Keep Crew Bulletin pages to end of PDF
     if (crewBulletinStartPage !== null) {
         for (
@@ -11600,6 +12044,19 @@ document.getElementById("downloadBtn").addEventListener("click", async () => {
             exportDoc.getPages()[exportPageIndex];
 
         const scale = 1.5;
+
+        // Segment time text (not a highlight rectangle)
+        if (h.text) {
+            page.drawText(h.text, {
+                x: h.x / scale,
+                y: page.getHeight() - (h.y / scale),
+                size: 6,
+                font: exportUnicodeFont,
+                color: PDFLib.rgb(0, 0, 1)
+            });
+
+            continue;
+        }
 
         page.drawRectangle({
             x:

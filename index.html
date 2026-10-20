@@ -5955,6 +5955,9 @@ function containsWholeAirway(text, airway){
     return re.test(text);
 }
 
+// Ordered legs of the OFP (name, MSA, asterisk flag, leg distance) - filled by extractHighGroundWaypoints
+let ofpLegs = [];
+
 async function extractHighGroundWaypoints(ofpFile){
     const seen = new Set();
 
@@ -5964,6 +5967,7 @@ async function extractHighGroundWaypoints(ofpFile){
     // Terrain codes found vs. codes whose waypoint (17 tokens back) is readable
     let terrainCodeCount = 0;
     let unreadableTerrainCodes = 0;
+    const unreadableDetails = [];
 
     //--------------------------------------------------
     // PASS 1 - Extract all high ground waypoints
@@ -5985,8 +5989,25 @@ async function extractHighGroundWaypoints(ofpFile){
 
                 terrainCodeCount++;
 
-                if(!waypoint || !/^[A-Z0-9]{2,6}$/.test(waypoint)){
+                // Warning check only: if the token 17 back is a number
+                // (flight level), the real waypoint is one token further back
+                // (same rule the legs extraction uses), so judge that one.
+                const checkWaypoint = /^\d{3}(\.\d)?$/.test(waypoint || "")
+                    ? words[i - 18]
+                    : waypoint;
+
+                if(!checkWaypoint || !/^[A-Z0-9]{2,6}$/.test(checkWaypoint)){
                     unreadableTerrainCodes++;
+
+                    // Diagnostics only (console) - shows exactly what was found
+                    unreadableDetails.push({
+                        page: p,
+                        tokenIndex: i,
+                        code: token,
+                        candidate: checkWaypoint === undefined ? "(none - not enough tokens before)" : checkWaypoint,
+                        next: words[i + 1] || null,
+                        context: words.slice(Math.max(0, i - 20), i + 2).join(" ")
+                    });
                 }
 
                 if(
@@ -6004,8 +6025,20 @@ async function extractHighGroundWaypoints(ofpFile){
     if(terrainCodeCount > 0 && unreadableTerrainCodes > 0){
         addExtractionWarning(
             `High ground: ${unreadableTerrainCodes} of ${terrainCodeCount} ` +
-            `terrain codes had no readable waypoint (the OFP layout may have changed)`
+            `terrain codes had no readable waypoint (the OFP layout may have changed) - see console for details`
         );
+
+        console.groupCollapsed(
+            `HIGH GROUND: ${unreadableDetails.length} unreadable terrain code(s)`
+        );
+        console.table(unreadableDetails.map(({context, ...rest}) => rest));
+        unreadableDetails.forEach(d => {
+            console.warn(
+                `[P${d.page}] ${d.code} (token ${d.tokenIndex}) candidate=` +
+                `${JSON.stringify(d.candidate)}\n  ...${d.context}`
+            );
+        });
+        console.groupEnd();
     }
 
     //--------------------------------------------------
@@ -6017,7 +6050,7 @@ async function extractHighGroundWaypoints(ofpFile){
         "ADN","AWIND","TAS","VWS","ZFRQ","AFRM","COORD",
         "MSA","DIS","PFL","RETA","IMT","PDN","FWIND",
         "GSP","DRM","PFRM","DIFF","ZFW","TOTAL","DCT",
-        "PRFM", "CFP"
+        "PRFM", "CFP", "FO"
     ]);
 
     for(let k = 0; k < waypoints.length; k++){
@@ -6072,6 +6105,9 @@ async function extractHighGroundWaypoints(ofpFile){
             k++;
         }
     }
+
+    // Ordered leg list for the coverage-based profile finder (v2)
+    ofpLegs = parseOfpLegs(pageWords);
 
     console.log("High Ground Waypoints");
     console.log(waypoints);
@@ -6849,22 +6885,332 @@ async function findDecompressionProfiles(highGroundWaypoints, airways){
     return matches;
 }
 
+//==================================================
+// DECOMPRESSION PROFILE FINDER v2  (coverage based)
+//
+// Uses profiles_index.json (built from decompression_profiles.pdf by
+// build_profile_index.py) instead of parsing the Quick Search Table at runtime.
+//
+//   PROFILE_FINDER = "v2"      -> new matcher (falls back to legacy if the index cannot be loaded)
+//   PROFILE_FINDER = "legacy"  -> original Quick Search Table matcher, unchanged
+//==================================================
+const PROFILE_FINDER = "v2";
+const COMPARE_PROFILE_FINDERS = true;   // also run legacy and log the differences (testing)
+const WARN_UNCOVERED_TERRAIN = false;   // true = add an extraction warning when terrain is left uncovered
+const PROFILE_MIN_NEW_TERRAIN = 2;      // a profile must cover at least this many still-uncovered terrain waypoints
+const PROFILE_MAX_GAP_LEGS = 6;         // unlabeled terrain waypoints count as covered only between profile waypoints <= this many legs apart
+
+/// ordered legs: [{name, msa, star, dis, unnamed}]
+function parseOfpLegs(pageWords){
+    const legs = [];
+
+    for(const words of pageWords){
+        for(let i = 0; i + 5 < words.length; i++){
+            // coordinate line, e.g.  N40 36.5 E048 10.0
+            if(!(
+                /^[NS]\d{2}$/.test(words[i]) &&
+                /^\d{2}\.\d$/.test(words[i + 1]) &&
+                /^[EW]\d{3}$/.test(words[i + 2]) &&
+                /^\d{2}\.\d$/.test(words[i + 3])
+            )) continue;
+
+            // waypoint name = token before the ACTM (hh.mm) column, skipping a navaid frequency
+            let name = null;
+            for(let j = i - 1; j > Math.max(i - 20, 0); j--){
+                if(/^\d{2}\.\d{2}$/.test(words[j])){
+                    name = words[j - 1];
+
+                    if(/^\d{3}\.\d{1,3}$/.test(name))
+                        name = words[j - 2];
+
+                    break;
+                }
+            }
+
+            if(!name || !/^-?[A-Z0-9]{2,6}$/.test(name))
+                continue;
+
+            let msa = null, star = false, dis = null;
+
+            const t = words[i + 4];
+            const m = /^(\d{3})(\*?)(\d{4})$/.exec(t);
+
+            if(m){
+                msa = parseInt(m[1], 10);
+                star = m[2] === "*";
+                dis = parseInt(m[3], 10);
+            } else if(/^\d{3}$/.test(t) && /^\d{4}$/.test(words[i + 5])){
+                msa = parseInt(t, 10);
+                dis = parseInt(words[i + 5], 10);
+            } else if(/^\d{4}$/.test(t)){
+                dis = parseInt(t, 10);
+            }
+
+            legs.push({
+                name: name.replace(/^-/, ""),
+                msa,
+                star,
+                dis,
+                unnamed: name.startsWith("-")
+            });
+        }
+    }
+
+    return legs;
+}
+
+let profileIndexPromise = null;
+function loadProfileIndex(){
+    if(!profileIndexPromise){
+        profileIndexPromise = fetch("./profiles_index.json")
+            .then(r => {
+                if(!r.ok) throw new Error("profiles_index.json: HTTP " + r.status);
+                return r.json();
+            })
+            .catch(err => {
+                profileIndexPromise = null;
+                throw err;
+            });
+    }
+    return profileIndexPromise;
+}
+
+async function findDecompressionProfilesV2(legs, ofpAirways){
+    const index = await loadProfileIndex();
+
+    const named = legs.filter(l => !l.unnamed);
+    const airwaySet = new Set(ofpAirways);
+
+    // name -> every leg index where it occurs
+    const posByName = new Map();
+    named.forEach((l, i) => {
+        if(!posByName.has(l.name)) posByName.set(l.name, []);
+        posByName.get(l.name).push(i);
+    });
+
+    // terrain = legs with an asterisked MSA (same definition as the OFP annotation)
+    const terrain = [];
+    named.forEach((l, i) => { if(l.star) terrain.push(i); });
+
+    console.groupCollapsed("DECOMP PROFILES v2");
+    console.log("Terrain waypoints:", terrain.map(i => named[i].name));
+    console.log("OFP airways:", ofpAirways);
+
+    if(terrain.length === 0){
+        console.log("No terrain waypoints.");
+        console.groupEnd();
+        return [];
+    }
+
+    //--------------------------------------------------
+    // 1. CANDIDATES
+    //--------------------------------------------------
+    const candidates = [];
+
+    for(const p of index.profiles){
+        const wl = new Set([...(p.waypoints || []), ...(p.headerWaypoints || [])]);
+
+        // leg indices this profile's diagram touches
+        const covered = [];
+        for(const w of wl){
+            if(posByName.has(w)) covered.push(...posByName.get(w));
+        }
+        covered.sort((a, b) => a - b);
+
+        // must name at least one terrain waypoint explicitly
+        const explicit = terrain.filter(i => wl.has(named[i].name));
+        if(explicit.length === 0) continue;
+
+        // must share an airway with the OFP (or, for DCT-style profiles, 2+ header waypoints)
+        const airwayMatches = (p.airways || []).filter(a => airwaySet.has(a));
+
+        if((p.airways || []).length > 0){
+            if(airwayMatches.length === 0) continue;
+        } else {
+            const hw = (p.headerWaypoints || []).filter(w => posByName.has(w));
+            if(hw.length < 2) continue;
+        }
+
+        // terrain between two covered legs that are close together counts as covered
+        // (unlabeled points such as DUDEG/KADVI/TABAS that the diagram does not print)
+        const cover = new Set(explicit);
+        for(let k = 0; k + 1 < covered.length; k++){
+            const a = covered[k], b = covered[k + 1];
+            if(b - a <= PROFILE_MAX_GAP_LEGS){
+                terrain.forEach(i => { if(i >= a && i <= b) cover.add(i); });
+            }
+        }
+
+        candidates.push({
+            p,
+            explicit,
+            cover,
+            airwayMatches,
+            unmatched: (p.airways || []).length - airwayMatches.length,
+            endsOnRoute: [p.from, p.to].filter(e => posByName.has(e)).length
+        });
+    }
+
+    //--------------------------------------------------
+    // 2. GREEDY COVER
+    //   rank: new terrain covered > OFP airways shared > fewer unmatched airways > ends on route
+    //--------------------------------------------------
+    const left = new Set(terrain);
+    const picks = [];
+
+    const keyOf = c => [
+        [...c.cover].filter(i => left.has(i)).length,
+        c.airwayMatches.length,
+        -c.unmatched,
+        c.endsOnRoute
+    ];
+
+    const cmp = (a, b) => {
+        for(let i = 0; i < a.length; i++){
+            if(a[i] !== b[i]) return a[i] - b[i];
+        }
+        return 0;
+    };
+
+    while(left.size > 0){
+        let best = null;
+        let bestKey = null;
+
+        for(const c of candidates){
+            const key = keyOf(c);
+            if(key[0] < PROFILE_MIN_NEW_TERRAIN) continue;
+            if(!best || cmp(key, bestKey) > 0){
+                best = c;
+                bestKey = key;
+            }
+        }
+
+        if(!best) break;
+
+        const ties = candidates
+            .filter(c => c !== best && cmp(keyOf(c), bestKey) === 0)
+            .map(c => c.p.name);
+
+        const newlyCovered = [...best.cover].filter(i => left.has(i)).sort((a, b) => a - b);
+
+        console.log(
+            `PICK ${best.p.name} (${best.p.route})`,
+            {
+                newTerrain: newlyCovered.map(i => named[i].name),
+                ofpAirways: best.airwayMatches,
+                unmatchedAirways: best.unmatched,
+                ties
+            }
+        );
+
+        picks.push({
+            route: best.p.route,
+            waypoint: named[newlyCovered[0]].name,
+            airway: best.airwayMatches.join(", "),
+            airwayTokens: best.airwayMatches,
+            profile: best.p.name,
+            page: best.p.page,
+            method: "COVERAGE",
+            covers: newlyCovered.map(i => named[i].name),
+            ties
+        });
+
+        newlyCovered.forEach(i => left.delete(i));
+    }
+
+    const uncovered = [...left].sort((a, b) => a - b).map(i => named[i].name);
+
+    if(uncovered.length > 0){
+        // show which profiles mention it at all, and why they were not selected (manual check aid)
+        uncovered.forEach(w => {
+            const naming = index.profiles
+                .filter(p =>
+                    (p.waypoints || []).includes(w) ||
+                    (p.headerWaypoints || []).includes(w)
+                )
+                .map(p => {
+                    const shared = (p.airways || []).filter(a => airwaySet.has(a));
+                    return shared.length || !(p.airways || []).length
+                        ? p.name
+                        : `${p.name} (no airway in common with OFP)`;
+                });
+
+            console.warn(
+                `UNCOVERED terrain waypoint ${w}`,
+                naming.length
+                    ? { profilesNamingIt: naming }
+                    : "(no profile diagram names it)"
+            );
+        });
+
+        if(WARN_UNCOVERED_TERRAIN){
+            addExtractionWarning(
+                `Decompression profiles: no profile covers terrain waypoint(s) ${uncovered.join(", ")} - check manually`
+            );
+        }
+    }
+
+    console.log("v2 RESULT:", picks.map(p => p.profile));
+    console.groupEnd();
+
+    picks.uncovered = uncovered;
+    return picks;
+}
+
+function logProfileComparison(v2, legacy){
+    const a = new Set(v2.map(p => p.profile));
+    const b = new Set(legacy.map(p => p.profile));
+
+    console.groupCollapsed("DECOMP PROFILES: v2 vs legacy");
+    console.log("v2:    ", [...a]);
+    console.log("legacy:", [...b]);
+    console.log("only in v2:    ", [...a].filter(x => !b.has(x)));
+    console.log("only in legacy:", [...b].filter(x => !a.has(x)));
+    console.groupEnd();
+}
+
 const highGroundWaypoints =
     await extractHighGroundWaypoints(fileInput.files[0]);
 
 let profiles = [];
 
 try {
-    profiles =
-        await findDecompressionProfiles(
-            highGroundWaypoints,
-            airways
-        );
+    if(PROFILE_FINDER === "v2"){
+        try {
+            profiles = await findDecompressionProfilesV2(ofpLegs, airways);
+        } catch (err) {
+            console.error("Profile finder v2 failed, falling back to legacy:", err);
+
+            profiles = await findDecompressionProfiles(
+                highGroundWaypoints,
+                airways
+            );
+        }
+
+        if(COMPARE_PROFILE_FINDERS){
+            try {
+                const legacyProfiles = await findDecompressionProfiles(
+                    highGroundWaypoints,
+                    airways
+                );
+
+                logProfileComparison(profiles, legacyProfiles);
+            } catch (err) {
+                console.warn("Legacy comparison failed:", err);
+            }
+        }
+    } else {
+        profiles =
+            await findDecompressionProfiles(
+                highGroundWaypoints,
+                airways
+            );
+    }
 } catch (err) {
     console.error("Decompression profile lookup failed:", err);
 
     addExtractionWarning(
-        "Decompression profiles: could not load or read decompression_profiles.pdf"
+        "Decompression profiles: could not load or read decompression_profiles.pdf / profiles_index.json"
     );
 }
 

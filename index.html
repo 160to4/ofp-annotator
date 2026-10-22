@@ -7951,35 +7951,43 @@ for (let i = 0; i < pagesToRender.length; i++) {
             }
             /// Flight time highlight
             if (upper.includes("BURNOFF")) {
-                const valueItem = items[i + 2];
-
-                if (valueItem && valueItem.str) {
-                    const burnTime = valueItem.str;
-
-                    if (/^\d{2}\.\d{2}$/.test(burnTime)) {
-                        const t = valueItem.transform || item.transform;
-
-                        burnoffHighlight = {
-                            page: 0,
-                            transform: t,
-                            text: burnTime
-                        };
-
-                        const tx = t[4] * scale;
-                        const ty = viewport.height - (t[5] * scale);
-
-                        const charWidth = 9;
-                        const width = burnTime.length * charWidth;
-
-                        octx.fillStyle = "rgba(255, 235, 59, 0.5)";
-                        octx.fillRect(tx, ty - 10, width, 15);
-
-                        burnoffTime = burnTime;
-                        window.burnoffTime = burnTime;
-
-                        console.log("✅ BURNOFF TIME EXTRACTED:", burnoffTime);
-                        console.log("📄 Page:", pageNum);
+                // The figure normally sits 2 items after the word, but look a few
+                // items ahead so a different text split doesn't break it.
+                let valueItem = null;
+                for (let k = 1; k <= 4 && i + k < items.length; k++) {
+                    const cand = items[i + k];
+                    if (cand && cand.str && /^\d{2}\.\d{2}$/.test(cand.str.trim())) {
+                        valueItem = cand;
+                        break;
                     }
+                }
+
+                if (valueItem) {
+                    const burnTime = valueItem.str.trim();
+                    const t = valueItem.transform || item.transform;
+
+                    burnoffHighlight = {
+                        page: pageNum - 1,
+                        transform: t,
+                        text: burnTime
+                    };
+
+                    const tx = t[4] * scale;
+                    const ty = viewport.height - (t[5] * scale);
+
+                    const charWidth = 9;
+                    const width = burnTime.length * charWidth;
+
+                    octx.save();
+                    octx.fillStyle = "rgba(255, 235, 59, 0.5)";
+                    octx.fillRect(tx, ty - 10, width, 15);
+                    octx.restore();
+
+                    burnoffTime = burnTime;
+                    window.burnoffTime = burnTime;
+
+                    console.log("✅ BURNOFF TIME EXTRACTED:", burnoffTime);
+                    console.log("📄 Page:", pageNum);
                 }
             }
             ///Burn-off
@@ -8156,7 +8164,7 @@ for (let i = 0; i < pagesToRender.length; i++) {
             }
 
             ///EXCESS FUEL
-            if (i >= 50 && upper.includes("EXCESS FUEL")) {
+            if ((pageNum > 1 || i >= 50) && upper.includes("EXCESS FUEL")) {
                 const valueItem = items[i + 4];
 
                 if (valueItem && valueItem.str) {
@@ -11319,6 +11327,15 @@ document.getElementById("downloadBtn").addEventListener("click", async () => {
             apdHighlight.transform,
             offset,
             3 * 6
+        );
+    }
+
+    if (burnoffHighlight && pdfPages[burnoffHighlight.page]) {
+        drawOffsetHighlight(
+            pdfPages[burnoffHighlight.page],
+            burnoffHighlight.transform,
+            0,
+            burnoffHighlight.text.length * 6
         );
     }
 

@@ -1656,6 +1656,11 @@ function matchesGroup(text, group) {
     return group.some(k => text.includes(k));
 }
 
+///Always show page-1 figures with 1 decimal place (e.g. 11 -> 11.0)
+function fmt1(n) {
+    return (typeof n === "number" && isFinite(n)) ? n.toFixed(1) : String(n);
+}
+
 ///ANNOTATION DRAW FUNCTION
 function drawPdfText(page, text, x, y) {
     // x/y are stored in the original PDF coordinate system.
@@ -4583,6 +4588,29 @@ function resolveDestinationWeather(periods, time) {
     }
 
     // =====================================================
+    // 5b. Add BECMG groups that have started by arrival
+    //
+    // A BECMG (e.g. BECMG 2216/2219 12010KT) is a lasting change
+    // that begins at validFrom and is complete by validTo. If arrival
+    // is inside that window (or after it) the new conditions apply or
+    // are developing, so the group is applicable.
+    // =====================================================
+
+    const applicableBECMGs = periods
+        .filter(p =>
+            p.type === "BECMG" &&
+            p.validFrom &&
+            time >= p.validFrom
+        )
+        .sort((a, b) => a.validFrom - b.validFrom);
+
+    for (const bg of applicableBECMGs) {
+        if (!all.includes(bg)) {
+            all.push(bg);
+        }
+    }
+
+    // =====================================================
     // 6. Add applicable TEMPO / INTER / PROB groups
     // =====================================================
 
@@ -5312,6 +5340,53 @@ function analyseWind(period, runwayHeading) {
     return alerts;
 }
 
+///WIND SHIFT -> POSSIBLE RUNWAY CHANGE
+// Lasting wind changes (BECMG / FM) that give a tailwind on the planned runway.
+function analyseWindShiftTailwind(periods, runway) {
+    const alerts = [];
+    const heading = runwayHeading(runway);
+
+    if (heading === null || !periods)
+        return alerts;
+
+    const TAILWIND_LIMIT_KT = 5;
+
+    for (const period of periods) {
+        if (!period || !period.wind)
+            continue;
+
+        if (period.type !== "BECMG" && period.type !== "FM")
+            continue;
+
+        const wind = parseWind(period.wind, period.other);
+
+        if (!wind || wind.direction === null)
+            continue;
+
+        let diff = Math.abs(wind.direction - heading);
+
+        if (diff > 180)
+            diff = 360 - diff;
+
+        // Component along the runway: negative = tailwind
+        const component = wind.speed * Math.cos(diff * Math.PI / 180);
+        const tailwind = Math.round(-component);
+
+        if (tailwind >= TAILWIND_LIMIT_KT) {
+            const label = period.type === "FM"
+                ? `FM${period.validFromText}`
+                : `BECMG ${period.validFromText}/${period.validToText}`;
+
+            alerts.push({
+                severity: "caution",
+                text: `RWY${runway} tailwind ${tailwind}KT with ${label} ${period.wind} - potential RWY change`
+            });
+        }
+    }
+
+    return alerts;
+}
+
 ///TEMPERATURE ANALYSIS
 // Moisture present in any of the given METAR/TAF periods?
 // Matches precipitation, mist/fog, showers, thunderstorms, freezing types.
@@ -5843,6 +5918,11 @@ if (destApplicable) {
     destWind = analyseWind(
         destApplicable.base,
         runwayHeading(arrivalRunway)
+    ).concat(
+        analyseWindShiftTailwind(
+            destApplicable.overlays,
+            arrivalRunway
+        )
     );
 
     destTemp = analyseTemperature(
@@ -8002,7 +8082,7 @@ for (let i = 0; i < pagesToRender.length; i++) {
 
                         burnoffAnnotation = {
                             page: pageNum - 1,
-                            text: String(converted),
+                            text: fmt1(converted),
                             x: t[4] * scale + 65,
                             y: viewport.height - (t[5] * scale),
                             canvas: true
@@ -8011,7 +8091,7 @@ for (let i = 0; i < pagesToRender.length; i++) {
                         octx.fillStyle = "blue";
                         octx.font = "12px Helvetica";
                         octx.fillText(
-                            converted,
+                            fmt1(converted),
                             t[4] * scale + 65,
                             viewport.height - (t[5] * scale)
                         );
@@ -8031,7 +8111,7 @@ for (let i = 0; i < pagesToRender.length; i++) {
                         const t = valueItem.transform || item.transform;
                         contingencyAnnotation = {
                             page: pageNum - 1,
-                            text: converted,
+                            text: fmt1(converted),
                             x: t[4] + (65 / scale),
                             y: t[5]
                         };
@@ -8040,7 +8120,7 @@ for (let i = 0; i < pagesToRender.length; i++) {
 
                         octx.fillStyle = "blue";
                         octx.font = "12px Helvetica";
-                        octx.fillText(converted, tx + 65, ty);
+                        octx.fillText(fmt1(converted), tx + 65, ty);
                     }
                 }
             }
@@ -8056,7 +8136,7 @@ for (let i = 0; i < pagesToRender.length; i++) {
 
                         alternateFuelAnnotation = {
                             page: pageNum - 1,
-                            text: converted,
+                            text: fmt1(converted),
                             x: t[4] + (65 / scale),
                             y: t[5]
                         };
@@ -8069,7 +8149,7 @@ for (let i = 0; i < pagesToRender.length; i++) {
 
                         octx.fillStyle = "blue";
                         octx.font = "12px Helvetica";
-                        octx.fillText(converted, tx + 65, ty);
+                        octx.fillText(fmt1(converted), tx + 65, ty);
                     }
                 }
             }
@@ -8085,7 +8165,7 @@ for (let i = 0; i < pagesToRender.length; i++) {
 
                         alternateHoldAnnotation = {
                             page: pageNum - 1,
-                            text: converted,
+                            text: fmt1(converted),
                             x: t[4] + (65 / scale),
                             y: t[5]
                         };
@@ -8098,7 +8178,7 @@ for (let i = 0; i < pagesToRender.length; i++) {
 
                         octx.fillStyle = "blue";
                         octx.font = "12px Helvetica";
-                        octx.fillText(converted, tx + 65, ty);
+                        octx.fillText(fmt1(converted), tx + 65, ty);
                     }
                 }
             }
@@ -8115,7 +8195,7 @@ for (let i = 0; i < pagesToRender.length; i++) {
 
                         taxiFuelAnnotation = {
                             page: pageNum - 1,
-                            text: converted,
+                            text: fmt1(converted),
                             x: t[4] + (65 / scale),
                             y: t[5]
                         };
@@ -8128,7 +8208,7 @@ for (let i = 0; i < pagesToRender.length; i++) {
 
                         octx.fillStyle = "blue";
                         octx.font = "12px Helvetica";
-                        octx.fillText(converted, tx + 65, ty);
+                        octx.fillText(fmt1(converted), tx + 65, ty);
                     }
                 }
             }
@@ -8145,7 +8225,7 @@ for (let i = 0; i < pagesToRender.length; i++) {
 
                         flightPlanRequirementAnnotation = {
                             page: pageNum - 1,
-                            text: converted,
+                            text: fmt1(converted),
                             x: t[4] + (65 / scale),
                             y: t[5]
                         };
@@ -8158,13 +8238,19 @@ for (let i = 0; i < pagesToRender.length; i++) {
 
                         octx.fillStyle = "blue";
                         octx.font = "12px Helvetica";
-                        octx.fillText(converted, tx + 65, ty);
+                        octx.fillText(fmt1(converted), tx + 65, ty);
                     }
                 }
             }
 
             ///EXCESS FUEL
-            if ((pageNum > 1 || i >= 50) && upper.includes("EXCESS FUEL")) {
+            // The real fuel line is "EXCESS FUEL  <time>  <6-digit kg>". The
+            // "EXCESS FUEL:" headings (summary list / EDTO CFP page) are followed by
+            // other text such as "2.FMC", which used to be parsed as a bogus 0.1.
+            // Validate the value instead of relying on the item index, so it works
+            // on any page.
+            if (upper.includes("EXCESS FUEL") && !upper.includes(":") &&
+                items[i + 4] && /^\d{6}$/.test((items[i + 4].str || "").trim())) {
                 const valueItem = items[i + 4];
 
                 if (valueItem && valueItem.str) {
@@ -8177,7 +8263,7 @@ for (let i = 0; i < pagesToRender.length; i++) {
 
                         excessFuelAnnotation = {
                             page: pageNum - 1,
-                            text: converted,
+                            text: fmt1(converted),
                             x: t[4] + (65 / scale),
                             y: t[5]
                         };
@@ -8187,7 +8273,7 @@ for (let i = 0; i < pagesToRender.length; i++) {
 
                         octx.fillStyle = "blue";
                         octx.font = "12px Helvetica";
-                        octx.fillText(converted, tx + 65, ty);
+                        octx.fillText(fmt1(converted), tx + 65, ty);
                     }
                 }
             }
@@ -8204,7 +8290,7 @@ for (let i = 0; i < pagesToRender.length; i++) {
 
                         fuelInTanksAnnotation = {
                             page: pageNum - 1,
-                            text: converted,
+                            text: fmt1(converted),
                             x: t[4] + (65 / scale),
                             y: t[5]
                         };
@@ -8217,7 +8303,7 @@ for (let i = 0; i < pagesToRender.length; i++) {
 
                         octx.fillStyle = "blue";
                         octx.font = "12px Helvetica";
-                        octx.fillText(converted, tx + 65, ty);
+                        octx.fillText(fmt1(converted), tx + 65, ty);
                     }
                 }
             }
@@ -8323,7 +8409,7 @@ for (let i = 0; i < pagesToRender.length; i++) {
 
                         landingFuelAnnotation = {
                             page: pageNum - 1,
-                            text: `LDG FUEL: ${ldgFuel}`,
+                            text: `LDG FUEL: ${fmt1(ldgFuel)}`,
                             x: t[4],
                             y: t[5] - (20 / scale)
                         };
@@ -8334,7 +8420,7 @@ for (let i = 0; i < pagesToRender.length; i++) {
                         octx.fillStyle = "blue";
                         octx.font = "12px Helvetica";
                         octx.fillText(
-                            `LDG FUEL: ${ldgFuel}`,
+                            `LDG FUEL: ${fmt1(ldgFuel)}`,
                             tx,
                             ty + 20
                         );
@@ -8358,7 +8444,7 @@ for (let i = 0; i < pagesToRender.length; i++) {
 
                         pzfwAnnotation = {
                             page: pageNum - 1,
-                            text: converted,
+                            text: fmt1(converted),
                             x: t[4] + (110 / scale),
                             y: t[5] + (1 / scale)
                         };
@@ -8368,7 +8454,7 @@ for (let i = 0; i < pagesToRender.length; i++) {
 
                         octx.fillStyle = "blue";
                         octx.font = "12px Helvetica";
-                        octx.fillText(converted, tx + 110, ty + 1);
+                        octx.fillText(fmt1(converted), tx + 110, ty + 1);
                     }
                 }
             }
@@ -8391,7 +8477,7 @@ for (let i = 0; i < pagesToRender.length; i++) {
 
                         ptowAnnotation = {
                             page: pageNum - 1,
-                            text: converted,
+                            text: fmt1(converted),
                             x: t[4] + (110 / scale),
                             y: t[5] + (1 / scale)
                         };
@@ -8401,7 +8487,7 @@ for (let i = 0; i < pagesToRender.length; i++) {
 
                         octx.fillStyle = "blue";
                         octx.font = "12px Helvetica";
-                        octx.fillText(converted, tx + 110, ty + 1);
+                        octx.fillText(fmt1(converted), tx + 110, ty + 1);
                     }
                 }
             }
@@ -8423,7 +8509,7 @@ for (let i = 0; i < pagesToRender.length; i++) {
 
                         plwtAnnotation = {
                             page: pageNum - 1,
-                            text: converted,
+                            text: fmt1(converted),
                             x: t[4] + (110 / scale),
                             y: t[5] + (1 / scale)
                         };
@@ -8433,7 +8519,7 @@ for (let i = 0; i < pagesToRender.length; i++) {
 
                         octx.fillStyle = "blue";
                         octx.font = "12px Helvetica";
-                        octx.fillText(converted, tx + 110, ty + 1);
+                        octx.fillText(fmt1(converted), tx + 110, ty + 1);
 
                         if (rtow !== null) {
                             rtowAnnotation = {
@@ -8453,14 +8539,14 @@ for (let i = 0; i < pagesToRender.length; i++) {
                         if (excess !== null) {
                             excessAnnotation = {
                                 page: pageNum - 1,
-                                text: `EXCESS ${excess}`,
+                                text: `EXCESS ${fmt1(excess)}`,
                                 x: t[4] + (62 / scale),
                                 y: t[5] - (32 / scale)
                             };
 
                             octx.fillStyle = "blue";
                             octx.font = "12px Helvetica";
-                            octx.fillText(`EXCESS  ${excess}`, tx + 62, ty + 32);
+                            octx.fillText(`EXCESS  ${fmt1(excess)}`, tx + 62, ty + 32);
                         }
                     }
                 }
@@ -10493,7 +10579,7 @@ for (let i = 0; i < pagesToRender.length; i++) {
             const result = sumAltFuel(altnFuelValue, altnFuelHoldValue);
 
             if (result !== null) {
-                const text = `> ${result} ${altnAirport}`;
+                const text = `> ${fmt1(result)} ${altnAirport}`;
 
                 reservesAnnotation = {
                     page: pageNum - 1,

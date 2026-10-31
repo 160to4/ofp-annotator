@@ -77,7 +77,7 @@ canvas.overlayCanvas {
 <body>
 
 <div class="header">
-    <h2>OFP Annotation Tool v2.5</h2>
+    <h2>OFP Annotation Tool v2.6</h2>
 </div>
 
 <div class="upload">
@@ -1952,10 +1952,14 @@ let reservesAnnotation = null;
 let sidStarAnnotation = null;
 let highGroundAnnotation = null;
 let decompProfilesAnnotation = null;
+let profileAirportsAnnotation = null;
 let edtoAnnotation = null;
 let firAnnotation = null;
 let weatherAnnotation = null;
 let windArrowAnnotation = null;
+let altnSummaryPage = null;      // 1-based page containing "FLT PLANNING ALTN SUMMARY:"
+let annotationAfterPage = null;  // 1-based page the blank annotation page follows
+let summaryLastPage = null;      // 1-based last page of the summary block
 let crewBulletinAnnotation = null;
 let pageTitleAnnotations = [];
 let notamHighlights = [];
@@ -1965,6 +1969,17 @@ const intamAgeAnnotations = [];
 let forecastWaypointHighlights = [];
 const forecastRecommendationAnnotations = [];
 const legsWaypointMatches = [];
+let decompProfilesPdfPromise = null;   // cached decompression_profiles.pdf
+// Some legs rows print the nav-aid frequency in the same text item as the
+// waypoint ("UGILU 116.6", "INRAK 445"); this returns just the waypoint.
+function cleanLegsWaypoint(tok) {
+    const t = String(tok || "").trim();
+    const m = t.match(/^(\S+)\s+\d{3,4}(?:\.\d{1,2})?$/);
+
+    return m ? m[1] : t;
+}
+
+const legsClbDesMatches = [];   // waypoints on CLB / DES legs + their TRK
 window.burnoffTime = "";
 window.planNumber = "";
 let edtoHighlights = [];
@@ -2089,10 +2104,14 @@ function resetState() {
     sidStarAnnotation = null;
     highGroundAnnotation = null;
     decompProfilesAnnotation = null;
+    profileAirportsAnnotation = null;
     edtoAnnotation = null;
     firAnnotation = null;
     weatherAnnotation = null;
     windArrowAnnotation = null;
+    altnSummaryPage = null;
+    annotationAfterPage = null;
+    summaryLastPage = null;
     crewBulletinAnnotation = null;
     pageTitleAnnotations = [];
     notamHighlights = [];
@@ -2102,6 +2121,7 @@ function resetState() {
     forecastWaypointHighlights = [];
     forecastRecommendationAnnotations.length = 0;
     legsWaypointMatches.length = 0;
+    legsClbDesMatches.length = 0;
     edtoHighlights = [];
     bobcatWaypoint = null;
     bobcatFL = null;
@@ -2474,6 +2494,7 @@ fileInput.addEventListener("change", async (e) => {
         // Add anything here that looks like a waypoint
         // but isn't actually one.
         "CLB",
+        "DES",
         "DSC",
         "UTC",
         "TAS",
@@ -2578,7 +2599,7 @@ fileInput.addEventListener("change", async (e) => {
         // WAYPOINT + TRK EXTRACTION
         // =================================================
         for (let i = 0; i < tokens.length; i++) {
-            const token = tokens[i];
+            const token = cleanLegsWaypoint(tokens[i]);
 
             if (waypointBlacklist.has(token)) {
                 continue;
@@ -2625,6 +2646,12 @@ fileInput.addEventListener("change", async (e) => {
                 ) {
                     const searchToken = (tokens[j] || "").trim();
 
+                    // This row's FL column says CLB / DES: no cruise FL here.
+                    // Stop, so the next row's FL / TRK is not picked up.
+                    if (/\b(CLB|DES|DSC)\s*\.\.\.\s*\d{3}\b/.test(searchToken)) {
+                        break;
+                    }
+
                     const match = searchToken.match(
                         /(\d{3})\s*\.\.\.\s*(\d{3})\b/
                     );
@@ -2644,6 +2671,64 @@ fileInput.addEventListener("change", async (e) => {
                     trkToken = searchToken;
 
                     break;
+                }
+
+                // =================================================
+                // ROW SPLIT ACROSS A PAGE BREAK
+                // The waypoint name + time can be the last thing on a page
+                // while the second line of its row ("... 300 ... 277 ...")
+                // is the first item on the next page. If this looks like a
+                // leg row (it has a time) but no FL ... TRK was found before
+                // the end of the page, look at the start of the next page.
+                // =================================================
+                if (
+                    trkToken === null &&
+                    waypointTime !== null &&
+                    i + 10 >= tokens.length - 1 &&
+                    p < legsEndPage
+                ) {
+                    const nextTokens = pages[p]?.tokens || [];
+
+                    for (
+                        let j = 0;
+                        j < Math.min(8, nextTokens.length);
+                        j++
+                    ) {
+                        const searchToken = (nextTokens[j] || "").trim();
+
+                        if (/\b(CLB|DES|DSC)\s*\.\.\.\s*\d{3}\b/.test(searchToken)) {
+                            break;
+                        }
+
+                        const match = searchToken.match(
+                            /(\d{3})\s*\.\.\.\s*(\d{3})\b/
+                        );
+
+                        if (!match) {
+                            continue;
+                        }
+
+                        const trackNumber = Number(match[2]);
+
+                        if (trackNumber < 0 || trackNumber > 360) {
+                            continue;
+                        }
+
+                        flightLevel = match[1];
+                        track = match[2];
+                        trkToken = searchToken;
+
+                        console.log(
+                            "LEG ROW CONTINUES ON NEXT PAGE:",
+                            token,
+                            "page",
+                            p,
+                            "->",
+                            p + 1
+                        );
+
+                        break;
+                    }
                 }
 
                 legsWaypointMatches.push({
@@ -2699,7 +2784,7 @@ fileInput.addEventListener("change", async (e) => {
                         ? i - 9
                         : i - 7;
 
-                const waypointBefore = tokens[waypointIndex] || null;
+                const waypointBefore = cleanLegsWaypoint(tokens[waypointIndex]) || null;
 
                 clbMatches.push({
                     page: p,
@@ -2711,6 +2796,109 @@ fileInput.addEventListener("change", async (e) => {
             }
         }
     }
+
+    // =================================================
+    // CLB / DES WAYPOINT + TRK EXTRACTION
+    // Legs rows on climb / descent show "CLB ... 158" / "DES ... 158"
+    // (or DSC) in the FL column, so the normal FL ... TRK search skips them.
+    // The waypoint is the nearest waypoint-looking item before that item
+    // (rows without a VWS value have fewer items, so a fixed offset is not
+    // reliable).
+    // =================================================
+    legsClbDesMatches.length = 0;
+
+    const isLegsWaypointToken = t =>
+        !waypointBlacklist.has(t) && (
+            /^(?:[A-Z]{2}|[A-Z]{3}|[A-Z]{5})$/.test(t) ||
+            /^\d{2}[NSEW]\d{2}$/.test(t) ||
+            /^[A-Z]{2}\d{2}[A-Z]$/.test(t) ||
+            /^(?=[0-9NSEW]{5}$)(?=.*[NSEW])(?=.*\d)[0-9NSEW]+$/.test(t)
+        );
+
+    for (let p = legsStartPage; p <= legsEndPage; p++) {
+        const tokens = pages[p - 1].tokens;
+
+        for (let i = 0; i < tokens.length; i++) {
+            const m = (tokens[i] || "").match(
+                /\b(CLB|DES|DSC)\s*\.\.\.\s*(\d{3})\b/
+            );
+
+            if (!m) continue;
+
+            const trackNumber = Number(m[2]);
+
+            if (trackNumber < 0 || trackNumber > 360) continue;
+
+            let waypointIndex = -1;
+
+            for (let j = i - 1; j >= Math.max(0, i - 12); j--) {
+                if (isLegsWaypointToken(cleanLegsWaypoint(tokens[j]))) {
+                    waypointIndex = j;
+                    break;
+                }
+            }
+
+            let waypoint =
+                waypointIndex >= 0
+                    ? cleanLegsWaypoint(tokens[waypointIndex])
+                    : null;
+
+            // Row split across a page break: waypoint is at the end of the
+            // previous page
+            if (waypoint === null && i < 12 && p > legsStartPage) {
+                const prevTokens = pages[p - 2].tokens;
+
+                for (
+                    let j = prevTokens.length - 1;
+                    j >= Math.max(0, prevTokens.length - 14);
+                    j--
+                ) {
+                    if (isLegsWaypointToken(cleanLegsWaypoint(prevTokens[j]))) {
+                        waypoint = cleanLegsWaypoint(prevTokens[j]);
+                        break;
+                    }
+                }
+            }
+
+            legsClbDesMatches.push({
+                page: p,
+                index: waypointIndex,
+                phase: m[1] === "CLB" ? "CLB" : "DES",
+                waypoint,
+                track: m[2],
+                prevFL: null,
+                nextFL: null
+            });
+        }
+    }
+
+    // Flight levels either side of each CLB / DES waypoint (from the normal
+    // legs rows) so the forecast-wind pass can pick the matching level.
+    {
+        const key = (page, index) => page * 100000 + index;
+
+        const withFL = legsWaypointMatches
+            .filter(w => w.flightLevel !== null)
+            .map(w => ({ k: key(w.page, w.index), fl: Number(w.flightLevel) }))
+            .sort((x, y) => x.k - y.k);
+
+        for (const c of legsClbDesMatches) {
+            const k = key(c.page, c.index);
+
+            for (const w of withFL) {
+                if (w.k < k) c.prevFL = w.fl;
+            }
+
+            c.nextFL = withFL.find(w => w.k > k)?.fl ?? null;
+        }
+    }
+
+    console.log(
+        "CLB/DES WAYPOINT/TRK:",
+        legsClbDesMatches.map(
+            w => `${w.phase} ${w.waypoint} TRK${w.track}`
+        )
+    );
 
     // =================================================
     // REMOVE WAYPOINTS WITHOUT FL OR TRK
@@ -3535,6 +3723,20 @@ fileInput.addEventListener("change", async (e) => {
             .replace(/\s+(BECMG)\b/g, "\n$1");
     }
 
+    /* -----------------------------
+    PAGE HEADER / FOOTER STRIPPER
+    The OFP prints "SIA 227/27Oct26/WSSS-YMML Reg:9VSWM OFP:20/0/1" and
+    "Page 21 of 80" at the end of every page, so they land in the middle
+    of any weather block that runs across a page break.
+    ------------------------------ */
+    function stripPageFurniture(str) {
+        return str
+            .replace(/\bSIA\s+\d+\/\S+(?:\s+Reg:\S+)?(?:\s+OFP:\S+)?/g, " ")
+            .replace(/\bPage\s+\d+\s+of\s+\d+\b/gi, " ")
+            .replace(/\s+/g, " ")
+            .trim();
+    }
+
     /* =========================================================
     SCAN WX BLOCK
     ========================================================= */
@@ -3582,7 +3784,7 @@ fileInput.addEventListener("change", async (e) => {
                   }
               }
 
-              destinationWX = buf.trim();
+              destinationWX = stripPageFurniture(buf);
           }
 
             /* =========================
@@ -3591,31 +3793,210 @@ fileInput.addEventListener("change", async (e) => {
             if (t.includes("DEPARTURE AIRPORT:")) {
                 let buf = "";
                 let started = false;
+                let finished = false;
 
-                for (let j = i; j < tokens.length; j++) {
-                    const t2 = tokens[j];
+                // The block can run over a page break (SA on one page, FT on
+                // the next), so keep going page by page until the end marker.
+                for (let pp = p; pp <= wxEndPage && !finished; pp++) {
+                    const scanTokens = pages[pp - 1].tokens;
 
-                    // STOP BEFORE including "Space Weather Advisory:"
-                    if (t2.includes("Space Weather Advisory:")) {
-                        break;
-                    }
+                    for (let j = (pp === p ? i : 0); j < scanTokens.length; j++) {
+                        const t2 = scanTokens[j];
 
-                    // WAIT FOR SA BEFORE STARTING CAPTURE
-                    if (!started) {
-                        if (t2 === "SA") {
-                            started = true;
-                            buf += " " + t2;
+                        // STOP BEFORE including "Space Weather Advisory:"
+                        if (
+                            t2.includes("Space Weather Advisory:") ||
+                            t2.includes("AIRPORTLIST ENDED")
+                        ) {
+                            finished = true;
+                            break;
                         }
-                        continue;
-                    }
 
-                    // once started, keep collecting
-                    buf += " " + t2;
+                        // WAIT FOR SA BEFORE STARTING CAPTURE
+                        if (!started) {
+                            if (t2 === "SA") {
+                                started = true;
+                                buf += " " + t2;
+                            }
+                            continue;
+                        }
+
+                        // once started, keep collecting
+                        buf += " " + t2;
+                    }
                 }
 
-                departureWX = buf.trim();
+                departureWX = stripPageFurniture(buf);
             }
         }
+    }
+
+    /* =========================================================
+    PER-AIRPORT WX TEXT (SA + FT) FROM THE OFP AIRPORT WX LIST
+    Used to colour the decompression profile airports on page 2.
+    ========================================================= */
+    const airportWxText = new Map();   // ICAO -> all SA / FT text
+
+    if (wxStartPage !== null && wxEndPage !== null) {
+        let currentIcao = null;
+        let buf = [];
+
+        const commit = () => {
+            if (currentIcao) {
+                const prev = airportWxText.get(currentIcao) || "";
+                airportWxText.set(
+                    currentIcao,
+                    stripPageFurniture(prev + " " + buf.join(" "))
+                );
+            }
+            buf = [];
+        };
+
+        scan:
+        for (let p = wxStartPage; p <= wxEndPage; p++) {
+            for (const tk of pages[p - 1].tokens) {
+                const up = tk.toUpperCase();
+
+                const h = up.match(/^\s*([A-Z]{4})\/[A-Z0-9]{3}(?![A-Z0-9])/);
+
+                if (h) {
+                    commit();
+                    currentIcao = h[1];
+                    continue;
+                }
+
+                if (
+                    up.includes("SPACE WEATHER ADVISORY:") ||
+                    up.includes("AIRPORTLIST ENDED")
+                ) {
+                    commit();
+                    currentIcao = null;
+                    break scan;
+                }
+
+                if (currentIcao) buf.push(tk);
+            }
+        }
+
+        commit();
+    }
+
+    // Returns the list of unfavourable-weather reasons found in an airport's
+    // SA + FT text (every forecast group counts, TEMPO / PROB / BECMG too).
+    function assessAirportWx(raw) {
+        const reasons = new Set();
+
+        if (!raw) return [];
+
+        const tokens = raw
+            .toUpperCase()
+            .replace(/=/g, " ")
+            .split(/\s+/)
+            .filter(Boolean);
+
+        const WX_CODES = new Set([
+            "MI", "BC", "PR", "DR", "BL", "SH", "TS", "FZ",
+            "DZ", "RA", "SN", "SG", "IC", "PL", "GR", "GS", "UP",
+            "BR", "FG", "FU", "VA", "DU", "SA", "HZ", "PO", "SQ",
+            "FC", "SS", "DS"
+        ]);
+
+        for (let i = 0; i < tokens.length; i++) {
+            const t = tokens[i];
+            let m;
+
+            // ---- wind / gusts (KT or MPS)
+            if ((m = t.match(/^(?:\d{3}|VRB)(\d{2,3})(?:G(\d{2,3}))?(KT|MPS)$/))) {
+                const k = m[3] === "MPS" ? 1.944 : 1;
+                const spd = Number(m[1]) * k;
+                const gust = m[2] ? Number(m[2]) * k : 0;
+
+                if (gust >= 25) {
+                    reasons.add(`GUST ${Math.round(gust)}KT`);
+                } else if (spd >= 25) {
+                    reasons.add(`WIND ${Math.round(spd)}KT`);
+                } else if (gust >= 20 && gust - spd >= 10) {
+                    reasons.add(`GUSTY ${Math.round(spd)}G${Math.round(gust)}`);
+                }
+
+                continue;
+            }
+
+            // ---- visibility in metres (<= 2000)
+            if (/^\d{4}$/.test(t)) {
+                if (Number(t) <= 2000) reasons.add(`VIS ${Number(t)}M`);
+                continue;
+            }
+
+            // ---- visibility in statute miles (<= 1SM), "1 1/2SM" aware
+            if ((m = t.match(/^(\d+)(?:\/(\d+))?SM$/))) {
+                let sm = m[2] ? Number(m[1]) / Number(m[2]) : Number(m[1]);
+
+                if (m[2] && /^\d$/.test(tokens[i - 1] || "")) {
+                    sm += Number(tokens[i - 1]);
+                }
+
+                if (sm <= 1) reasons.add(`VIS ${m[0]}`);
+                continue;
+            }
+
+            // ---- low ceiling (BKN / OVC / VV at 300ft or lower)
+            if ((m = t.match(/^(BKN|OVC|VV)(\d{3})/))) {
+                if (Number(m[2]) <= 3) reasons.add(`CIG ${Number(m[2]) * 100}FT`);
+            }
+
+            // ---- significant convective cloud
+            if (/^(SCT|BKN|OVC)\d{3}(CB|TCU)$/.test(t)) {
+                reasons.add("CB/TCU");
+                continue;
+            }
+
+            // ---- low level wind shear group
+            if (/^WS\d{3}\//.test(t)) {
+                reasons.add("WS");
+                continue;
+            }
+
+            // ---- present weather: [+-][VC][pairs of 2 letters]
+            m = t.match(/^([-+]?)(VC)?((?:[A-Z]{2})+)$/);
+
+            if (!m) continue;
+
+            const intensity = m[1];
+            const body = m[3];
+
+            // report-type markers / words, not weather
+            if (!m[2] && !intensity && ["SA", "FT", "FC"].includes(body)) continue;
+
+            const codes = body.match(/../g);
+
+            if (!codes.every(c => WX_CODES.has(c))) continue;
+
+            const has = c => codes.includes(c);
+
+            if (has("TS")) reasons.add("TS");
+            if (has("HZ")) reasons.add("HZ");
+            if (has("FG")) reasons.add("FG");
+            if (has("FU")) reasons.add("FU");
+            if (has("FZ")) reasons.add("FZ");
+            if (has("VA")) reasons.add("VA");
+            if (has("SQ")) reasons.add("SQ");
+            if (has("GR") || has("GS")) reasons.add("HAIL");
+            if (has("SN") || has("SG") || has("PL") || has("IC")) reasons.add("SNOW/ICE");
+            if (has("DS") || has("SS")) reasons.add("DUST/SAND STORM");
+            if ((has("DU") || has("SA")) && (has("BL") || has("DR"))) reasons.add("BLDU/BLSA");
+            if (has("FC") && intensity === "+") reasons.add("+FC");
+            if (intensity === "+" && (has("RA") || has("DZ"))) reasons.add("+RA");
+        }
+
+        return [...reasons];
+    }
+
+    // ICAO -> reasons (empty array = OK, null = not in the OFP weather list)
+    function airportWxIssues(icao) {
+        if (!airportWxText.has(icao)) return null;
+
+        return assessAirportWx(airportWxText.get(icao));
     }
 
     /* =========================================================
@@ -3771,6 +4152,38 @@ function isRecentIntam(date) {
 const bulletinAnnotations = [];
 const recentIntamDates = [];
 
+// OFP (flight) date, e.g. "22OCT26" on page 1, used to age the "UPDATED" dates
+const intamOfpDate = parseOfpDate(
+    (pages[0].text.match(/\d{2}[A-Z]{3}\d{2}/) || [""])[0]
+);
+
+// "(UPDATED 16OCT2026)", "(UPDATED 30 MAY 25)", "(UPDATED 25 SEP 2026)" ...
+// The date can wrap onto the next line, so the title lines under the INTAM
+// header are joined before matching.
+function parseIntamUpdatedDate(followingTexts) {
+    const joined = followingTexts
+        .join(" ")
+        .split("====")[0]
+        .toUpperCase();
+
+    const m = joined.match(
+        /UPDATED\s+(\d{1,2})\s*([A-Z]{3})[A-Z]*\s*(\d{4}|\d{2})\b/
+    );
+
+    if (!m) return null;
+
+    const months = {
+        JAN: 0, FEB: 1, MAR: 2, APR: 3, MAY: 4, JUN: 5,
+        JUL: 6, AUG: 7, SEP: 8, OCT: 9, NOV: 10, DEC: 11
+    };
+
+    if (months[m[2]] === undefined) return null;
+
+    const year = m[3].length === 2 ? 2000 + Number(m[3]) : Number(m[3]);
+
+    return new Date(year, months[m[2]], Number(m[1]));
+}
+
 for (let p = crewBulletinStartPage; p <= pdf.numPages; p++) {
     const pg = pages[p - 1];
     const page = pg.page;
@@ -3799,10 +4212,30 @@ for (let p = crewBulletinStartPage; p <= pdf.numPages; p++) {
                     ? "TODAY"
                     : `${daysAgo} day${daysAgo === 1 ? "" : "s"} ago`;
 
+            // Updated date (if the title carries one), aged against the OFP date
+            let updatedLabel = "";
+
+            const updated = parseIntamUpdatedDate(
+                items.slice(i + 1, i + 5).map(it => it.str)
+            );
+
+            if (updated && !isNaN(intamOfpDate)) {
+                const n = Math.round(
+                    (intamOfpDate - updated) / (1000 * 60 * 60 * 24)
+                );
+
+                if (n >= 0) {
+                    updatedLabel =
+                        n === 0
+                            ? " - Updated today"
+                            : ` - Updated ${n} day${n === 1 ? "" : "s"} ago`;
+                }
+            }
+
             intamAgeAnnotations.push({
                 page: p - 1,
                 item: items[i],
-                label
+                label: label + updatedLabel
             });
         }
 
@@ -3825,31 +4258,42 @@ function daysSinceIntam(date) {
     return Math.floor((today - date) / (1000 * 60 * 60 * 24));
 }
 
-// Render from page 1 through the page containing the captain's approval.
-// The FIR / weather / wind-arrow annotations are drawn on page 2, so page 2 must
-// ALWAYS be rendered - even when the summary fits on one page (e.g. short CGK-SIN
-// flights) and the approval line is on page 1 (no overflow page).
+// Summary pages = page 1 through the page containing the captain's approval.
+// The FIR / weather / wind-arrow annotations are NOT drawn on OFP page 2 any
+// more: a blank page is inserted straight after the page holding
+// "FLT PLANNING ALTN SUMMARY:" and those annotations are drawn on it.
 const approvalPage = pages.find(pg =>
     pg.upperText.includes("APPROVED/ACCEPTED BY CAPT(SIGN)")
 )?.pageNumber;
 
+altnSummaryPage = pages.find(pg =>
+    pg.upperText.includes("FLT PLANNING ALTN SUMMARY:")
+)?.pageNumber ?? null;
+
+// If the ALTN SUMMARY page can't be found, put the blank page after page 1
+annotationAfterPage = altnSummaryPage ?? 1;
+
+summaryLastPage = Math.min(
+    Math.max(approvalPage ?? annotationAfterPage, annotationAfterPage),
+    pdf.numPages
+);
+
+// Preview-only page number for the blank page (real pages are 1..pdf.numPages)
+const annotationPageNum = pdf.numPages + 1;
+
 const pagesToRender = [];
 
-if (approvalPage !== undefined) {
-    const lastSummaryPage = Math.min(Math.max(approvalPage, 2), pdf.numPages);
-    for (let p = 1; p <= lastSummaryPage; p++) {
-        pagesToRender.push(p);
-    }
-} else {
-    // Fallback if the approval text cannot be found
-    console.warn("Captain approval text not found. Rendering pages 1-2.");
-    for (let p = 1; p <= Math.min(2, pdf.numPages); p++) {
-        pagesToRender.push(p);
+for (let p = 1; p <= summaryLastPage; p++) {
+    pagesToRender.push(p);
+
+    if (p === annotationAfterPage) {
+        pagesToRender.push(annotationPageNum);
     }
 }
 
 console.log("Pages to render:", pagesToRender);
 console.log("Approval page:", approvalPage);
+console.log("ALTN summary page:", altnSummaryPage);
 
 if (
     sidPage !== null &&
@@ -7252,6 +7696,183 @@ function logProfileComparison(v2, legacy){
 const highGroundWaypoints =
     await extractHighGroundWaypoints(fileInput.files[0]);
 
+///DECOMP PROFILE AIRPORTS (left / right of the diagram)
+// Each profile page lists its diversion airports in boxes on the left and
+// right of the diagram, written "(ICAO)". The diagram's centre is taken
+// from the "DEPRESSURIZATION ALONG ..." title line (the page itself is not
+// always centred on the diagram), then every "(ICAO)" is sorted by which
+// side of that centre it sits on.
+async function extractProfileAirports(pdfDoc, pageNo) {
+    const page = await pdfDoc.getPage(pageNo);
+    const viewport = page.getViewport({ scale: 1 });
+    const content = await page.getTextContent();
+
+    const items = [];
+
+    for (const it of content.items) {
+        const str = (it.str || "").trim();
+
+        if (!str) continue;
+
+        const [x, y] = viewport.convertToViewportPoint(
+            it.transform[4],
+            it.transform[5]
+        );
+
+        items.push({ str, x, y, w: it.width || 0 });
+    }
+
+    const airports = [];
+
+    // Primary method: every airport box ends with an "ELEV ..." line and
+    // the "(ICAO)" is on the line directly above it. The text above each
+    // ELEV is joined in x order, so it does not matter how the PDF (or the
+    // pdf.js version) splits "(LTAC)" into separate text items.
+    for (const e of items) {
+        if (!/^ELEV/.test(e.str)) continue;
+
+        const above = items
+            .filter(it =>
+                e.y - it.y > 4 && e.y - it.y < 14 &&
+                it.x >= e.x - 4 && it.x <= e.x + 70
+            )
+            .sort((a, b) => a.x - b.x)
+            .map(it => it.str)
+            .join("");
+
+        const m = above.match(/\(\s*([A-Z]{4})\s*\)/);
+
+        if (m) {
+            airports.push({ icao: m[1], x: e.x, y: e.y });
+        }
+    }
+
+    // Second method, added to the first: plain "(ICAO)" items, including
+    // codes whose brackets the PDF split into separate pieces.
+    {
+        const hasElevBelow = (x, y) =>
+            items.some(e =>
+                /^ELEV/.test(e.str) &&
+                Math.abs(e.x - x) < 30 &&
+                e.y - y > 3 && e.y - y < 25
+            );
+
+        for (let k = 0; k < items.length; k++) {
+            const it = items[k];
+            const next = items[k + 1];
+
+            let found = false;
+
+            for (const m of it.str.matchAll(/\(([A-Z]{4})\)/g)) {
+                airports.push({ icao: m[1], x: it.x, y: it.y });
+                found = true;
+            }
+
+            if (found) continue;
+
+            let m = it.str.match(/\(([A-Z]{4})$/);
+
+            if (m && hasElevBelow(it.x, it.y)) {
+                airports.push({ icao: m[1], x: it.x, y: it.y });
+                continue;
+            }
+
+            if (/\($/.test(it.str) && next) {
+                m = next.str.match(/^([A-Z]{4})\)/);
+
+                if (m && hasElevBelow(it.x, it.y)) {
+                    airports.push({ icao: m[1], x: it.x, y: it.y });
+                }
+            }
+        }
+    }
+
+    if (!airports.length) {
+        return { left: [], right: [] };
+    }
+
+    // Diagram centre. Airports on both sides: halfway between the two box
+    // columns. One side only: centre of the "DEPRESSURIZATION ALONG ..."
+    // title line (the page itself is not always centred on the diagram).
+    let centre = null;
+
+    const axs = airports.map(a => a.x);
+    const alo = Math.min(...axs);
+    const ahi = Math.max(...axs);
+
+    const title = items.find(i => /^DEPRESSURI[SZ]ATION/.test(i.str));
+
+    if (ahi - alo > 150) {
+        centre = (alo + ahi) / 2;
+    } else if (title) {
+        const line = items.filter(i => Math.abs(i.y - title.y) < 3);
+
+        centre =
+            (Math.min(...line.map(i => i.x)) +
+             Math.max(...line.map(i => i.x + i.w))) / 2;
+    } else {
+        const xs = airports.map(a => a.x);
+        const lo = Math.min(...xs);
+        const hi = Math.max(...xs);
+
+        centre = hi - lo > 150 ? (lo + hi) / 2 : viewport.width / 2;
+    }
+
+    airports.sort((a, b) => a.y - b.y || a.x - b.x);
+
+    const left = [];
+    const right = [];
+
+    for (const a of airports) {
+        const side = a.x < centre ? left : right;
+
+        if (!side.includes(a.icao)) {
+            side.push(a.icao);
+        }
+    }
+
+    return { left, right };
+}
+
+async function attachProfileAirports(list) {
+    if (!list || !list.length) return;
+
+    try {
+        if (!decompProfilesPdfPromise) {
+            decompProfilesPdfPromise =
+                pdfjsLib.getDocument("./decompression_profiles.pdf").promise;
+        }
+
+        const pdfDoc = await decompProfilesPdfPromise;
+
+        let index = null;
+
+        try {
+            index = await loadProfileIndex();
+        } catch (e) {
+            // page number may already be on the pick
+        }
+
+        for (const p of list) {
+            const pageNo =
+                p.page ||
+                index?.profiles?.find(x => x.name === p.profile)?.page;
+
+            if (!pageNo) continue;
+
+            p.airports = await extractProfileAirports(pdfDoc, pageNo);
+        }
+
+        console.log(
+            "PROFILE AIRPORTS:",
+            list.map(p => ({ profile: p.profile, ...(p.airports || {}) }))
+        );
+    } catch (err) {
+        decompProfilesPdfPromise = null;
+        console.warn("Profile airport extraction failed:", err);
+    }
+}
+
 let profiles = [];
 
 try {
@@ -7305,7 +7926,54 @@ console.log("High Ground Waypoints:", highGroundWaypoints);
 console.log("Airways:", airways);
 console.log("Profiles:", profiles);
 
+await attachProfileAirports(profiles);
+
 ///HELPERS FOR FORECAST WIND PAGES
+// Compares the CLB / DES leg tracks with the 4 CLB / DES wind levels.
+// The phase's tracks (in flight order) are resampled to one TRK per wind
+// level (first ... last, evenly spaced), the HW/TW component is worked out
+// per level, then the trend is read from first level to last level.
+function analyseClimbDescentWinds(phase, winds) {
+    const legs = legsClbDesMatches.filter(w => w.phase === phase);
+
+    if (!legs.length || !winds || !winds.length) {
+        return null;
+    }
+
+    const n = winds.length;
+
+    const tracks = winds.map((w, k) => {
+        const idx = n === 1
+            ? 0
+            : Math.round(k * (legs.length - 1) / (n - 1));
+
+        return Number(legs[idx].track);
+    });
+
+    // Positive = headwind, negative = tailwind
+    const comps = winds.map((w, k) =>
+        windComponent(tracks[k], Number(w.dir), Number(w.spd))
+    );
+
+    const mean = comps.reduce((a, b) => a + b, 0) / n;
+    const delta = comps[n - 1] - comps[0];
+    const isHW = mean >= 0;
+
+    // HW: stronger when the component rises. TW: stronger when it falls.
+    const increasing = isHW ? delta > 0 : delta < 0;
+
+    const label = `${increasing ? "Increasing" : "Decreasing"} ${isHW ? "HW" : "TW"}`;
+
+    console.log(`${phase} WIND ANALYSIS:`, {
+        waypoints: legs.length,
+        tracks,
+        components: comps.map(c => Number(c.toFixed(1))),
+        label
+    });
+
+    return label;
+}
+
 function windComponent(track, windDir, windSpeed) {
     let diff = Math.abs(track - windDir);
 
@@ -7402,7 +8070,576 @@ for (let i = 0; i < pagesToRender.length; i++) {
     let netBurnoffTime = null;
     let netDrawn = false;
 
+    // Draws the FIR / departure+destination WX / climb+descent wind annotations
+    // on the blank page that follows the ALTN SUMMARY page.
+    function drawAnnotationPage(octx, pageNum) {
+        // Layout (canvas px at 1.5x). The red "ADDITIONAL INFO" title sits at
+        // the top; content starts 20px below it. FIR info is on the left,
+        // weather analysis in the right column with the wind arrows under it.
+        const topY = 88;
+        const weatherX = 510;
+        let weatherBottomY = topY;
+        let firBottomY = topY;   // baseline of the last FIR row
+
+        ///FIR
+        {
+            const lines = [];
+
+            lines.push("FIR INFO:");
+
+            for (const a of annotations) {
+                lines.push(
+                    `${a.time || ""}  ${a.fir || ""} - ${a.firName || "not in database"}  ${a.waypoint || ""} ${a.fallbackTime ? "(" + a.fallbackTime + ")" : ""}  ${a.country || ""}`
+                );
+            }
+
+            firAnnotation = {
+                page: pageNum - 1,
+                x: 65,
+                y: topY,
+                rows: annotations
+            };
+
+            // Preview
+            octx.fillStyle = "blue";
+            octx.font = "10px Helvetica";
+
+            // Header
+            octx.fillText("FIR Info:", 65, topY);
+
+            let y = topY + 15;
+
+            // column positions
+            const x1 = 65;   // TIME
+            const x2 = 100;  // FIR
+            const x3 = 230;  // WAYPOINT
+            const x4 = 280;  // FALLBACK
+            const x5 = 320;  // COUNTRY
+
+            for (const a of annotations) {
+                octx.fillText(
+                    a.time || "",
+                    x1,
+                    y
+                );
+
+                octx.fillText(
+                    `${a.fir || ""} - ${a.firName || ""}`,
+                    x2,
+                    y
+                );
+
+                octx.fillText(
+                    a.waypoint || "",
+                    x3,
+                    y
+                );
+
+                if (a.fallbackTime) {
+                    octx.fillText(
+                        `(${a.fallbackTime})`,
+                        x4,
+                        y
+                    );
+                }
+
+                octx.fillText(
+                    a.country || "",
+                    x5,
+                    y
+                );
+
+                y += 15;
+            }
+
+            firBottomY = topY + 15 * annotations.length;
+        }
+
+        ///WEATHER ANNOTATION
+        {
+            const lines = [];
+
+            // DEP SA + FT
+            lines.push({
+                text: "Departure WX:",
+                highlight: false
+            });
+
+            for (const weatherLine of depLines) {
+                lines.push({
+                    text: weatherLine,
+                    highlight: isApplicableWeatherLine(
+                        weatherLine,
+                        depApplicable
+                    )
+                });
+            }
+
+            lines.push({
+                text: ""
+            });
+
+            // DEP ANALYSIS
+            lines.push({
+                text: `DEP WX ANALYSIS AT ${notamDepTime}z:`,
+                highlight: false
+            });
+
+            depWxLines.forEach((line, i) => {
+                lines.push({
+                    text: `${i + 1}. ${line}`,
+                    highlight: false
+                });
+            });
+
+            lines.push({
+                text: ""
+            });
+
+            // DEST SA + FT
+            lines.push({
+                text: "Destination WX:",
+                highlight: false
+            });
+
+            for (const weatherLine of destLines) {
+                lines.push({
+                    text: weatherLine,
+                    highlight: isApplicableWeatherLine(
+                        weatherLine,
+                        destApplicable
+                    )
+                });
+            }
+
+            lines.push({
+                text: ""
+            });
+
+            // DEST ANALYSIS
+            lines.push({
+                text: `DEST WX ANALYSIS AT ${notamArrTime}z:`,
+                highlight: false
+            });
+
+            destWxLines.forEach((line, i) => {
+                lines.push({
+                    text: `${i + 1}. ${line}`,
+                    highlight: false
+                });
+            });
+
+            weatherAnnotation = {
+                page: pageNum - 1,
+                x: weatherX,
+                y: topY,
+                lines: lines
+            };
+
+            // PREVIEW
+            octx.font = "8px Helvetica";
+
+            let y = topY;
+
+            for (const line of lines) {
+                if (line.highlight) {
+                    const width = octx.measureText(
+                        line.text
+                    ).width;
+
+                    octx.fillStyle =
+                        "rgba(255,235,59,0.45)";
+
+                    octx.fillRect(
+                        weatherX - 2,
+                        y - 8,
+                        width + 4,
+                        9
+                    );
+                }
+
+                octx.fillStyle = "blue";
+
+                octx.fillText(
+                    line.text,
+                    weatherX,
+                    y
+                );
+
+                y += 12;
+            }
+
+            // Baseline of the last weather line
+            weatherBottomY = topY + 12 * (lines.length - 1);
+        }
+
+        /// WIND ARROWS RENDER
+        // Placed just below the weather analysis, left-aligned with it
+        {
+            const windTop = weatherBottomY + 30;
+
+            const windLabelX = weatherX;       // "CLB WINDS:" / "DES WINDS:"
+            const windStartX = weatherX + 30;  // first arrow + FL label
+
+            const clbLabelY = windTop;
+            const clbFlY = windTop + 10;
+            const clbArrowY = windTop + 30;
+
+            const desLabelY = windTop + 80;
+            const desFlY = windTop + 90;
+            const desArrowY = windTop + 110;
+
+            const clbFls = [
+                "100",
+                "180",
+                "240",
+                "300"
+            ];
+
+            const desFls = [
+                "350",
+                "310",
+                "200",
+                "100"
+            ];
+
+            windArrowAnnotation = {
+                page: pageNum - 1,
+
+                canvasHeight: octx.canvas.height,
+
+                clbWinds: clbWinds,
+                desWinds: desWinds,
+
+                labelX: windLabelX,
+                flX: windStartX,
+
+                clbLabelY: clbLabelY,
+                clbFlY: clbFlY,
+                clbX: windStartX,
+                clbY: clbArrowY,
+
+                desLabelY: desLabelY,
+                desFlY: desFlY,
+                desX: windStartX,
+                desY: desArrowY,
+
+                clbFls: clbFls,
+                desFls: desFls,
+
+                // Divider line 5px below whichever is lower: the DES arrows
+                // (reach 30px) or the last FIR row
+                dividerY: Math.max(desArrowY + 30, firBottomY) + 5,
+                canvasWidth: octx.canvas.width,
+
+                // HW / TW trend labels, drawn to the right of the arrows
+                trendX: windStartX + 4 * 50 + 15,
+                clbTrend: analyseClimbDescentWinds("CLB", clbWinds),
+                desTrend: analyseClimbDescentWinds("DES", desWinds)
+            };
+
+            // PREVIEW
+            octx.fillStyle = "blue";
+            octx.font = "10px Helvetica";
+
+            octx.fillText("CLB WINDS:", windLabelX, clbLabelY);
+
+            let x = windStartX;
+
+            for (const w of clbWinds) {
+                drawWindArrow(octx, x, clbArrowY, w.dir, w.spd);
+                x += 50;
+            }
+
+            if (windArrowAnnotation.clbTrend) {
+                octx.fillText(
+                    windArrowAnnotation.clbTrend,
+                    windArrowAnnotation.trendX,
+                    clbArrowY + 3
+                );
+            }
+
+            if (windArrowAnnotation.desTrend) {
+                octx.fillText(
+                    windArrowAnnotation.desTrend,
+                    windArrowAnnotation.trendX,
+                    desArrowY + 3
+                );
+            }
+
+            // DIVIDER LINE (inside the 40pt page border)
+            octx.save();
+            octx.strokeStyle = "#000000";
+            octx.lineWidth = 1;
+            octx.beginPath();
+            octx.moveTo(40 * 1.5, windArrowAnnotation.dividerY);
+            octx.lineTo(octx.canvas.width - 40 * 1.5, windArrowAnnotation.dividerY);
+            octx.stroke();
+            octx.restore();
+
+            octx.fillText("DES WINDS:", windLabelX, desLabelY);
+
+            x = windStartX;
+
+            for (const w of desWinds) {
+                drawWindArrow(octx, x, desArrowY, w.dir, w.spd);
+                x += 50;
+            }
+
+            // FL LABELS
+            octx.font = "8px Helvetica";
+
+            x = windStartX;
+
+            for (const fl of clbFls) {
+                octx.fillText(`FL${fl}`, x, clbFlY);
+                x += 50;
+            }
+
+            x = windStartX;
+
+            for (const fl of desFls) {
+                octx.fillText(`FL${fl}`, x, desFlY);
+                x += 50;
+            }
+        }
+
+        ///PROFILE AIRPORTS (left / right of each decompression profile)
+        // Centred on the page, below the divider line:
+        //   [reasons] L1  <-  PROFILE  -> R1 [reasons]
+        //                              -> R2
+        {
+            const withAirports = profiles.filter(
+                p => p.airports && (p.airports.left.length || p.airports.right.length)
+            );
+
+            if (withAirports.length && windArrowAnnotation) {
+                const FONT = "10px Helvetica";
+                octx.font = FONT;
+                const mw = t => octx.measureText(t).width;
+
+                const lineH = 12;
+                const gap = 4;                    // between profiles
+                const pad = 4;                    // between columns
+
+                // short readable labels for the weather reasons
+                const reasonLabel = r => {
+                    if (/^(GUST|GUSTY)/.test(r)) return "gusty";
+                    if (/^WIND/.test(r)) return "strong wind";
+                    if (/^VIS/.test(r)) return "low visibility";
+                    if (/^CIG/.test(r)) return "low ceiling";
+                    return ({
+                        "TS": "TS",
+                        "CB/TCU": "TCU",
+                        "+RA": "heavy rain",
+                        "HZ": "haze",
+                        "FG": "fog",
+                        "FU": "smoke",
+                        "FZ": "freezing",
+                        "VA": "volcanic ash",
+                        "SQ": "squalls",
+                        "HAIL": "hail",
+                        "SNOW/ICE": "snow/ice",
+                        "DUST/SAND STORM": "dust/sand storm",
+                        "BLDU/BLSA": "blowing dust/sand",
+                        "+FC": "funnel cloud",
+                        "WS": "wind shear"
+                    })[r] || r.toLowerCase();
+                };
+
+                const reasonText = issues =>
+                    issues && issues.length
+                        ? "(" + [...new Set(issues.map(reasonLabel))].join(", ") + ")"
+                        : "";
+
+                // ---- gather rows
+                const data = [];
+
+                for (const p of withAirports) {
+                    const L = p.airports.left;
+                    const R = p.airports.right;
+                    const n = Math.max(L.length, R.length);
+
+                    for (let r = 0; r < n; r++) {
+                        const li = L[r] ? airportWxIssues(L[r]) : null;
+                        const ri = R[r] ? airportWxIssues(R[r]) : null;
+
+                        data.push({
+                            first: r === 0,
+                            name: p.profile,
+                            left: L[r] || "",
+                            leftBad: !!(li && li.length),
+                            leftWhy: reasonText(li),
+                            right: R[r] || "",
+                            rightBad: !!(ri && ri.length),
+                            rightWhy: reasonText(ri),
+                            lastOfProfile: r === n - 1
+                        });
+                    }
+                }
+
+                // ---- column widths (canvas px)
+                const icaoW = mw("WWWW");
+                const arrowL = mw("<-");
+                const arrowR = mw("->");
+                const sp = mw(" ");
+                const leftWhyW = Math.max(0, ...data.map(d => d.leftWhy ? mw(d.leftWhy) : 0));
+                const rightWhyW = Math.max(0, ...data.map(d => d.rightWhy ? mw(d.rightWhy) : 0));
+                const nameW = Math.max(...data.map(d => mw(d.name))) + 2 * 6;
+
+                // Anchor everything on the profile name, which is always
+                // centred on the page; airports and reasons grow outwards.
+                const pageW = octx.canvas.width;
+                const colName = pageW / 2 - nameW / 2;
+                const colLArrow = colName - 2 - arrowL;
+                const colLeftIcao = colLArrow - pad - icaoW;
+                const colLeftWhyEnd = colLeftIcao - pad;          // right edge of left reasons
+                const colRArrow = colName + nameW;
+                const colRightIcao = colRArrow + arrowR + sp;
+                const colRightWhy = colRightIcao + icaoW + pad;
+
+                // ---- header + rows as positioned text items
+                const items = [];
+                const headerY = windArrowAnnotation.dividerY + 5 + 5 + 8;   // 5px below the line, +5px shift
+                let y = headerY;
+
+                items.push({
+                    text: "Decomp. Profile Airport Analysis:",
+                    x: 65,                      // same left edge as FIR info
+                    y,
+                    align: "l",
+                    red: false
+                });
+
+                y += lineH + 2;
+
+                for (const d of data) {
+                    if (d.leftWhy) {
+                        // ends just before this row's own airport code
+                        items.push({
+                            text: d.leftWhy,
+                            x: colLArrow - sp - mw(d.left) - 3,
+                            y,
+                            align: "r",
+                            red: true
+                        });
+                    }
+
+                    if (d.left) {
+                        // right-aligned so it sits one space before "<-", like the right side
+                        items.push({ text: d.left, x: colLArrow - sp, y, align: "r", red: d.leftBad });
+                    }
+
+                    if (d.first) {
+                        items.push({ text: "<-", x: colLArrow, y, align: "l", red: false });
+                        items.push({ text: d.name, x: colName + nameW / 2, y, align: "c", red: false });
+                    }
+
+                    if (d.right) {
+                        items.push({ text: "->", x: colRArrow, y, align: "l", red: false });
+                        items.push({ text: d.right, x: colRightIcao, y, align: "l", red: d.rightBad });
+                    }
+
+                    if (d.rightWhy) {
+                        // directly after this row's own airport code
+                        items.push({
+                            text: d.rightWhy,
+                            x: colRightIcao + mw(d.right) + 3,
+                            y,
+                            align: "l",
+                            red: true
+                        });
+                    }
+
+                    y += lineH;
+
+                    if (d.lastOfProfile) y += gap;
+                }
+
+                profileAirportsAnnotation = {
+                    page: pageNum - 1,
+                    canvasHeight: octx.canvas.height,
+                    items
+                };
+
+                // PREVIEW
+                octx.font = FONT;
+
+                for (const it of items) {
+                    octx.fillStyle = it.red ? "red" : "blue";
+
+                    const w = mw(it.text);
+                    const tx =
+                        it.align === "r" ? it.x - w :
+                        it.align === "c" ? it.x - w / 2 :
+                        it.x;
+
+                    octx.fillText(it.text, tx, it.y);
+                }
+
+                console.log(
+                    "PROFILE AIRPORT WX:",
+                    withAirports.flatMap(p =>
+                        [...p.airports.left, ...p.airports.right]
+                    ).filter((c, i, a) => a.indexOf(c) === i).map(c => ({
+                        airport: c,
+                        issues: airportWxIssues(c)
+                    }))
+                );
+            }
+        }
+    }
+
     for (const pageNum of pagesToRender) {
+        // Blank page inserted after the ALTN SUMMARY page: nothing to extract,
+        // it only carries the FIR / weather / wind annotations.
+        if (pageNum === annotationPageNum) {
+            const refViewport = pages[annotationAfterPage - 1].viewport;
+
+            const blankWrapper = document.createElement("div");
+            blankWrapper.className = "pageWrapper";
+
+            const blankCanvas = document.createElement("canvas");
+            blankCanvas.className = "pdfCanvas";
+            blankCanvas.width = refViewport.width;
+            blankCanvas.height = refViewport.height;
+
+            const blankCtx = blankCanvas.getContext("2d");
+            blankCtx.fillStyle = "#ffffff";
+            blankCtx.fillRect(0, 0, blankCanvas.width, blankCanvas.height);
+
+            // Black page border, same as the OFP pages:
+            // 1pt line inset 40pt from every edge (x1.5 preview scale)
+            blankCtx.strokeStyle = "#000000";
+            blankCtx.lineWidth = 1 * scale;
+            blankCtx.strokeRect(
+                40 * scale,
+                40 * scale,
+                blankCanvas.width - 80 * scale,
+                blankCanvas.height - 80 * scale
+            );
+
+            const blankOverlay = document.createElement("canvas");
+            blankOverlay.className = "overlayCanvas";
+            blankOverlay.width = refViewport.width;
+            blankOverlay.height = refViewport.height;
+
+            drawAnnotationPage(blankOverlay.getContext("2d"), pageNum);
+
+            blankWrapper.appendChild(blankCanvas);
+            blankWrapper.appendChild(blankOverlay);
+            viewer.appendChild(blankWrapper);
+
+            overlayByPage[pageNum] = blankOverlay;
+
+            renderedPages.push({
+                pdfCanvas: blankCanvas,
+                overlay: blankOverlay
+            });
+
+            continue;
+        }
+
         const pg = pages[pageNum - 1];
         const page = pg.page;
         const viewport = pg.viewport;
@@ -8000,7 +9237,8 @@ for (let i = 0; i < pagesToRender.length; i++) {
             }
             ///APD
             if (pageNum <= 4 && !apdHighlight) {
-                if (upper.includes("APD")) {
+                // Whole-word match only: "SAPDA" in the route line must not count
+                if (/\bAPD\b/.test(upper)) {
                     const target = str;
 
                     if (!target) continue;
@@ -9015,9 +10253,27 @@ for (let i = 0; i < pagesToRender.length; i++) {
                     // FIND WAYPOINT IN LEGS DATA
                     // =====================================================
 
-                    const waypointData = legsWaypointMatches.find(
-                        w => w.waypoint === token
+                    let waypointData = legsWaypointMatches.find(
+                        w => w.waypoint === token && w.flightLevel
                     );
+
+                    // Climb / descent waypoint ("CLB ... 317" in the FL column):
+                    // no cruise FL, so the level is picked from the forecast row.
+                    let climbDesData = null;
+
+                    if (!waypointData) {
+                        climbDesData = legsClbDesMatches.find(
+                            w => w.waypoint === token
+                        ) || null;
+
+                        if (climbDesData) {
+                            waypointData = {
+                                waypoint: climbDesData.waypoint,
+                                flightLevel: null,
+                                track: climbDesData.track
+                            };
+                        }
+                    }
 
                     if (waypointData) {
                         const waypoint = waypointData.waypoint;
@@ -9026,7 +10282,7 @@ for (let i = 0; i < pagesToRender.length; i++) {
 
                         // Only process valid forecast data.
                         // Do not use continue here: this is the outer items loop.
-                        if (flightLevel && Number.isFinite(track)) {
+                        if ((flightLevel || climbDesData) && Number.isFinite(track)) {
                             // Is this waypoint part of the CLB schedule?
                             const isClbWaypoint = clbWaypointSet.has(waypoint);
 
@@ -9079,7 +10335,45 @@ for (let i = 0; i < pagesToRender.length; i++) {
                                 // FIND CURRENT FL
                                 // =================================================
 
-                                const idx = fields.indexOf(flightLevel);
+                                let useFL = flightLevel;
+
+                                // CLB / DES waypoint: use the forecast level that lies
+                                // between the cruise levels before and after it.
+                                if (!useFL && climbDesData) {
+                                    const levels = [];
+
+                                    for (let q = 0; q + 1 < fields.length; q++) {
+                                        if (
+                                            /^\d{3}$/.test(fields[q]) &&
+                                            /^\d{5}$/.test(fields[q + 1])
+                                        ) {
+                                            levels.push(fields[q]);
+                                        }
+                                    }
+
+                                    const refs = [
+                                        climbDesData.prevFL,
+                                        climbDesData.nextFL
+                                    ].filter(v => v !== null);
+
+                                    if (levels.length && refs.length) {
+                                        const lo = Math.min(...refs);
+                                        const hi = Math.max(...refs);
+                                        const mid = (lo + hi) / 2;
+
+                                        const inside = levels.filter(
+                                            l => Number(l) >= lo && Number(l) <= hi
+                                        );
+
+                                        useFL = (inside.length ? inside : levels)
+                                            .sort((x, y) =>
+                                                Math.abs(Number(x) - mid) -
+                                                Math.abs(Number(y) - mid)
+                                            )[0];
+                                    }
+                                }
+
+                                const idx = useFL ? fields.indexOf(useFL) : -1;
 
                                 if (idx === -1) {
                                     continue;
@@ -9353,7 +10647,7 @@ for (let i = 0; i < pagesToRender.length; i++) {
 
                                 console.log(
                                     `FORECAST WIND | ${waypoint} | ` +
-                                    `CURRENT FL${flightLevel} | ` +
+                                    `CURRENT FL${useFL}${flightLevel ? "" : " (CLB/DES)"} | ` +
                                     `TRK ${track} | ` +
                                     `WIND ${windToken} | ` +
                                     `CURRENT ${windComponentValue.toFixed(1)}KT ` +
@@ -10754,300 +12048,6 @@ for (let i = 0; i < pagesToRender.length; i++) {
             }
         }
 
-        ///FIR
-        if (pageNum === 2) {
-            const lines = [];
-
-            lines.push("FIR INFO:");
-
-            for (const a of annotations) {
-                lines.push(
-                    `${a.time || ""}  ${a.fir || ""} - ${a.firName || "not in database"}  ${a.waypoint || ""} ${a.fallbackTime ? "(" + a.fallbackTime + ")" : ""}  ${a.country || ""}`
-                );
-            }
-
-            firAnnotation = {
-                page: 1,
-                x: 65,
-                y: 750,
-                rows: annotations
-            };
-
-            // Preview
-            octx.fillStyle = "blue";
-            octx.font = "10px Helvetica";
-
-            let y = 750;
-
-            // column positions
-            const x1 = 65;   // TIME
-            const x2 = 100;  // FIR
-            const x3 = 230;  // WAYPOINT
-            const x4 = 280;  // FALLBACK
-            const x5 = 320;  // COUNTRY
-
-            for (const a of annotations) {
-                octx.fillText(
-                    a.time || "",
-                    x1,
-                    y
-                );
-
-                octx.fillText(
-                    `${a.fir || ""} - ${a.firName || ""}`,
-                    x2,
-                    y
-                );
-
-                octx.fillText(
-                    a.waypoint || "",
-                    x3,
-                    y
-                );
-
-                if (a.fallbackTime) {
-                    octx.fillText(
-                        `(${a.fallbackTime})`,
-                        x4,
-                        y
-                    );
-                }
-
-                octx.fillText(
-                    a.country || "",
-                    x5,
-                    y
-                );
-
-                y += 15;
-            }
-        }
-
-        ///WEATHER ANNOTATION
-        if (pageNum === 2) {
-            const lines = [];
-
-            // DEP SA + FT
-            lines.push({
-                text: "Departure WX:",
-                highlight: false
-            });
-
-            for (const weatherLine of depLines) {
-                lines.push({
-                    text: weatherLine,
-                    highlight: isApplicableWeatherLine(
-                        weatherLine,
-                        depApplicable
-                    )
-                });
-            }
-
-            lines.push({
-                text: ""
-            });
-
-            // DEP ANALYSIS
-            lines.push({
-                text: `DEP WX ANALYSIS AT ${notamDepTime}z:`,
-                highlight: false
-            });
-
-            depWxLines.forEach((line, i) => {
-                lines.push({
-                    text: `${i + 1}. ${line}`,
-                    highlight: false
-                });
-            });
-
-            lines.push({
-                text: ""
-            });
-
-            // DEST SA + FT
-            lines.push({
-                text: "Destination WX:",
-                highlight: false
-            });
-
-            for (const weatherLine of destLines) {
-                lines.push({
-                    text: weatherLine,
-                    highlight: isApplicableWeatherLine(
-                        weatherLine,
-                        destApplicable
-                    )
-                });
-            }
-
-            lines.push({
-                text: ""
-            });
-
-            // DEST ANALYSIS
-            lines.push({
-                text: `DEST WX ANALYSIS AT ${notamArrTime}z:`,
-                highlight: false
-            });
-
-            destWxLines.forEach((line, i) => {
-                lines.push({
-                    text: `${i + 1}. ${line}`,
-                    highlight: false
-                });
-            });
-
-            weatherAnnotation = {
-                page: 1,
-                x: 510,
-                y: 750,
-                lines: lines
-            };
-
-            // PREVIEW
-            octx.font = "8px Helvetica";
-
-            let y = 750;
-
-            for (const line of lines) {
-                if (line.highlight) {
-                    const width = octx.measureText(
-                        line.text
-                    ).width;
-
-                    octx.fillStyle =
-                        "rgba(255,235,59,0.45)";
-
-                    octx.fillRect(
-                        510 - 2,
-                        y - 8,
-                        width + 4,
-                        9
-                    );
-                }
-
-                octx.fillStyle = "blue";
-
-                octx.fillText(
-                    line.text,
-                    510,
-                    y
-                );
-
-                y += 12;
-            }
-        }
-
-        /// WIND ARROWS RENDER
-        if (pageNum === 2) {
-            windArrowAnnotation = {
-                page: 1,
-
-                canvasHeight: octx.canvas.height,
-
-                clbWinds: clbWinds,
-                desWinds: desWinds,
-
-                clbX: 655,
-                clbY: 1100,
-
-                desX: 655,
-                desY: 1180
-            };
-
-            // PREVIEW
-
-            octx.fillStyle = "blue";
-            octx.font = "10px Helvetica";
-
-            octx.fillText(
-                "CLB WINDS:",
-                625,
-                1070
-            );
-
-            let x = 655;
-
-            for (const w of clbWinds) {
-                drawWindArrow(
-                    octx,
-                    x,
-                    1100,
-                    w.dir,
-                    w.spd
-                );
-
-                x += 50;
-            }
-
-            octx.fillText(
-                "DES WINDS:",
-                625,
-                1150
-            );
-
-            x = 655;
-
-            for (const w of desWinds) {
-                drawWindArrow(
-                    octx,
-                    x,
-                    1180,
-                    w.dir,
-                    w.spd
-                );
-
-                x += 50;
-            }
-
-            // FL LABELS
-
-            const flSpacing = 50;
-
-            octx.font = "8px Helvetica";
-
-            const clbFls = [
-                "100",
-                "180",
-                "240",
-                "300"
-            ];
-
-            x = 655;
-
-            for (const fl of clbFls) {
-                octx.fillText(
-                    `FL${fl}`,
-                    x,
-                    1080
-                );
-
-                x += flSpacing;
-            }
-
-            const desFls = [
-                "350",
-                "310",
-                "200",
-                "100"
-            ];
-
-            x = 655;
-
-            for (const fl of desFls) {
-                octx.fillText(
-                    `FL${fl}`,
-                    x,
-                    1160
-                );
-
-                x += flSpacing;
-            }
-
-            windArrowAnnotation.clbFls = clbFls;
-            windArrowAnnotation.desFls = desFls;
-        }
-
         // INTAMS
         if (pageNum >= crewBulletinStartPage) {
             // Draw "X days ago" beside each INTAM date
@@ -11229,6 +12229,7 @@ for (let i = 0; i < pagesToRender.length; i++) {
 
     const titles = [
         [1,                   planTitle],
+        [annotationPageNum,   "ADDITIONAL INFO"],
         [atcFlightPlanPage,   "ATC FLIGHT PLAN"],
         [sidPage,             "ROUTE LEGS"],
         [edtoStartPage,       "EDTO INFORMATION"],
@@ -11257,6 +12258,7 @@ for (let i = 0; i < pagesToRender.length; i++) {
     ///EXTRACTION CHECKS
     // Pages located by searching for fixed text
     const pageChecks = [
+        [altnSummaryPage,      'ALTN summary page ("FLT PLANNING ALTN SUMMARY:") - blank annotation page placed after page 1 instead'],
         [sidPage,              'Legs start page ("SID TOTAL DIST:")'],
         [starPage,             'Legs end page ("STAR TOTAL DIST:")'],
         [forecastStartPage,    'Forecast winds page ("FORECAST WIND -")'],
@@ -11293,7 +12295,7 @@ for (let i = 0; i < pagesToRender.length; i++) {
         [plwtAnnotation,              'PLWT'],
         [blockTimeAnnotation,         'Block time (dep/arr times)'],
         [netTimeAnnotation,           'Net time (block time vs burn-off)'],
-        [weatherAnnotation,           'Weather analysis (page 2)']
+        [weatherAnnotation,           'Weather analysis (blank annotation page)']
     ];
 
     for (const [value, label] of valueChecks) {
@@ -11333,6 +12335,28 @@ document.getElementById("downloadBtn").addEventListener("click", async () => {
     pdfDoc.registerFontkit(fontkit);
 
     const pdfPages = pdfDoc.getPages();
+
+    // Blank annotation page: appended at the end of the working doc so every
+    // existing page index stays valid, then moved into place via pagesToKeep.
+    // Its index (originalPageCount) matches the preview's pageNum - 1.
+    const originalPageCount = pdfPages.length;
+    const sizeRefPage =
+        pdfPages[(annotationAfterPage || 1) - 1] || pdfPages[0];
+
+    const blankAnnotPage =
+        pdfDoc.addPage([sizeRefPage.getWidth(), sizeRefPage.getHeight()]);
+
+    // Black page border, same as the OFP pages: 1pt line inset 40pt
+    blankAnnotPage.drawRectangle({
+        x: 40,
+        y: 40,
+        width: blankAnnotPage.getWidth() - 80,
+        height: blankAnnotPage.getHeight() - 80,
+        borderColor: PDFLib.rgb(0, 0, 0),
+        borderWidth: 1
+    });
+
+    pdfPages.push(blankAnnotPage);
 
     const firstPage = pdfPages[0];
 
@@ -11732,6 +12756,28 @@ document.getElementById("downloadBtn").addEventListener("click", async () => {
         }
     }
 
+    if (profileAirportsAnnotation) {
+        const a = profileAirportsAnnotation;
+        const page = pdfPages[a.page];
+
+        for (const it of a.items) {
+            const size = 6;
+            const w = unicodeFont.widthOfTextAtSize(it.text, size);
+            const x = it.x / 1.5;
+
+            page.drawText(it.text, {
+                x:
+                    it.align === "r" ? x - w :
+                    it.align === "c" ? x - w / 2 :
+                    x,
+                y: (a.canvasHeight - it.y) / 1.5,
+                size,
+                font: unicodeFont,
+                color: it.red ? PDFLib.rgb(1, 0, 0) : PDFLib.rgb(0, 0, 1)
+            });
+        }
+    }
+
     if (decompProfilesAnnotation) {
         const page = pdfPages[decompProfilesAnnotation.page];
         font: unicodeFont;
@@ -11773,6 +12819,20 @@ document.getElementById("downloadBtn").addEventListener("click", async () => {
     if (firAnnotation) {
         const page = pdfPages[firAnnotation.page];
         let y = page.getHeight() - (firAnnotation.y / 1.5);
+
+        page.drawText(
+            "FIR Info:",
+            {
+                x: firAnnotation.x / 1.5,
+                y,
+                size: 6,
+                font: unicodeFont,
+                color: PDFLib.rgb(0,0,1)
+            }
+        );
+
+        y -= 10;
+
         for (const a of firAnnotation.rows) {
             page.drawText(
                 a.time || "",
@@ -11889,8 +12949,8 @@ document.getElementById("downloadBtn").addEventListener("click", async () => {
         page.drawText(
             "CLB WINDS:",
             {
-                x: 625 / scale,
-                y: (canvasHeight - 1070) / scale,
+                x: windArrowAnnotation.labelX / scale,
+                y: (canvasHeight - windArrowAnnotation.clbLabelY) / scale,
                 size: 7,
                 font: unicodeFont,
                 color: PDFLib.rgb(0, 0, 1)
@@ -11923,10 +12983,10 @@ document.getElementById("downloadBtn").addEventListener("click", async () => {
         // CLIMB FL LABELS
         // =====================
 
-        x = 655 / scale;
+        x = windArrowAnnotation.flX / scale;
 
         const clbLabelY =
-            (canvasHeight - 1080) / scale;
+            (canvasHeight - windArrowAnnotation.clbFlY) / scale;
 
         for (const fl of windArrowAnnotation.clbFls) {
             page.drawText(
@@ -11943,6 +13003,20 @@ document.getElementById("downloadBtn").addEventListener("click", async () => {
             x += 50 / scale;
         }
 
+        // CLIMB HW / TW TREND
+        if (windArrowAnnotation.clbTrend) {
+            page.drawText(
+                windArrowAnnotation.clbTrend,
+                {
+                    x: windArrowAnnotation.trendX / scale,
+                    y: clbY - 2,
+                    size: 7,
+                    font: unicodeFont,
+                    color: PDFLib.rgb(0, 0, 1)
+                }
+            );
+        }
+
         // =====================
         // DESCENT TITLE
         // =====================
@@ -11950,8 +13024,8 @@ document.getElementById("downloadBtn").addEventListener("click", async () => {
         page.drawText(
             "DES WINDS:",
             {
-                x: 625 / scale,
-                y: (canvasHeight - 1150) / scale,
+                x: windArrowAnnotation.labelX / scale,
+                y: (canvasHeight - windArrowAnnotation.desLabelY) / scale,
                 size: 7,
                 font: unicodeFont,
                 color: PDFLib.rgb(0, 0, 1)
@@ -11980,14 +13054,41 @@ document.getElementById("downloadBtn").addEventListener("click", async () => {
             x += 50 / scale;
         }
 
+        // DIVIDER LINE (inside the 40pt page border)
+        {
+            const divY =
+                (canvasHeight - windArrowAnnotation.dividerY) / scale;
+
+            page.drawLine({
+                start: { x: 40, y: divY },
+                end: { x: windArrowAnnotation.canvasWidth / scale - 40, y: divY },
+                thickness: 1,
+                color: PDFLib.rgb(0, 0, 0)
+            });
+        }
+
+        // DESCENT HW / TW TREND
+        if (windArrowAnnotation.desTrend) {
+            page.drawText(
+                windArrowAnnotation.desTrend,
+                {
+                    x: windArrowAnnotation.trendX / scale,
+                    y: desY - 2,
+                    size: 7,
+                    font: unicodeFont,
+                    color: PDFLib.rgb(0, 0, 1)
+                }
+            );
+        }
+
         // =====================
         // DESCENT FL LABELS
         // =====================
 
-        x = 655 / scale;
+        x = windArrowAnnotation.flX / scale;
 
         const desLabelY =
-            (canvasHeight - 1160) / scale;
+            (canvasHeight - windArrowAnnotation.desFlY) / scale;
 
         for (const fl of windArrowAnnotation.desFls) {
             page.drawText(
@@ -12191,9 +13292,15 @@ document.getElementById("downloadBtn").addEventListener("click", async () => {
 
     const pagesToKeep = [];
 
-    // Always keep page 1 and 2
-    pagesToKeep.push(0);
-    pagesToKeep.push(1);
+    // Summary pages (1..summaryLastPage), with the blank annotation page
+    // straight after the "FLT PLANNING ALTN SUMMARY:" page
+    for (let p = 1; p <= summaryLastPage; p++) {
+        pagesToKeep.push(p - 1);
+
+        if (p === annotationAfterPage) {
+            pagesToKeep.push(originalPageCount);
+        }
+    }
 
     // Keep all LEGS pages
     if (
@@ -12269,7 +13376,7 @@ document.getElementById("downloadBtn").addEventListener("click", async () => {
     if (crewBulletinStartPage !== null) {
         for (
             let p = crewBulletinStartPage - 1;
-            p < pdfPages.length;
+            p < originalPageCount;
             p++
         ) {
             pagesToKeep.push(p);

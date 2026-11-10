@@ -77,7 +77,7 @@ canvas.overlayCanvas {
 <body>
 
 <div class="header">
-    <h2>OFP Annotation Tool v2.6</h2>
+    <h2>OFP Annotation Tool v2.7</h2>
 </div>
 
 <div class="upload">
@@ -2255,9 +2255,23 @@ fileInput.addEventListener("change", async (e) => {
     ///PREPROCESS PDF (ONE PASS ONLY)
     const pages = [];
 
-    for (let p = 1; p <= pdf.numPages; p++) {
-        const page = await pdf.getPage(p);
-        const textContent = await page.getTextContent();
+    // Pages are read in parallel batches (the pdf.js worker handles them
+    // concurrently); results are kept in page order.
+    const PAGE_BATCH = 8;
+
+    for (let start = 1; start <= pdf.numPages; start += PAGE_BATCH) {
+      const batch = [];
+
+      for (let p = start; p < start + PAGE_BATCH && p <= pdf.numPages; p++) {
+        batch.push((async () => {
+            const page = await pdf.getPage(p);
+            const textContent = await page.getTextContent();
+
+            return { p, page, textContent };
+        })());
+      }
+
+      for (const { p, page, textContent } of await Promise.all(batch)) {
         const viewport = page.getViewport({ scale });
 
         const items = textContent.items;
@@ -2276,6 +2290,7 @@ fileInput.addEventListener("change", async (e) => {
             upperText,
             viewport
         });
+      }
     }
 
     ///FIND ALL IMPORTANT PAGE LOCATIONS (ONE PASS)
@@ -2960,7 +2975,7 @@ fileInput.addEventListener("change", async (e) => {
                 return `${h}:${String(m).padStart(2, "0")}`;
             };
 
-            return `${format(start)} - ${format(end)}`;
+            return `${format(start)} - ${format(end)} (${format(end - start)})`;
         });
     }
 
@@ -4353,10 +4368,11 @@ for (let p = crewBulletinStartPage; p <= pdf.numPages; p++) {
     const text = pg.text;
     const upper = pg.upperText;
 
-    for (let i = 1; i < items.length - 1; i++) {
-        const prev = items[i - 1].str;
+    // every item (an INTAM header can be the very first item of a page)
+    for (let i = 0; i < items.length; i++) {
+        const prev = i > 0 ? items[i - 1].str : "";
         const current = items[i].str;
-        const next = items[i + 1].str;
+        const next = i + 1 < items.length ? items[i + 1].str : "";
 
         const token = current.trim();
 
@@ -4587,6 +4603,30 @@ if (notamStartPage !== null) {
     let inNotam = false;
     let inEnroute = false;
 
+    // En-route NOTAMs only count if valid at some point between
+    // (departure - 1h) and (arrival + 1h). No window if the times can't be read.
+    let airwayWinStart = null;
+    let airwayWinEnd = null;
+
+    {
+        const t1 = pages[0].text;
+        const d = (t1.match(/\d{2}[A-Z]{3}\d{2}/) || [])[0];
+        const dm = t1.match(/SCHED\s+DEP\s+(\d{4})/i);
+        const am = t1.match(/SCHED\s+ARR\s+(\d{4})/i);
+
+        if (d && dm && am) {
+            const dep = makeFlightDate(d, dm[1]);
+            const arr = makeFlightDate(d, am[1]);
+
+            if (arr < dep) arr.setUTCDate(arr.getUTCDate() + 1);
+
+            airwayWinStart = new Date(dep.getTime() - 3600000);
+            airwayWinEnd = new Date(arr.getTime() + 3600000);
+        }
+    }
+
+    let inNotamValid = true;
+
     for (let k = 0; k < notamStream.length; k++) {
         const { p, item, s } = notamStream[k];
 
@@ -4604,10 +4644,21 @@ if (notamStartPage !== null) {
             (notamStream[k + 1]?.s || "").startsWith("VALID:")
         ) {
             inNotam = true;
+
+            inNotamValid = true;
+
+            if (airwayWinStart) {
+                const v = parseNotamValidity(notamStream[k + 1].s);
+
+                // unreadable validity -> not highlighted (same as airport NOTAMs)
+                inNotamValid =
+                    !!v && v.start <= airwayWinEnd && v.end >= airwayWinStart;
+            }
+
             continue;
         }
 
-        if (!inNotam) continue;
+        if (!inNotam || !inNotamValid) continue;
 
         if (enrouteMarkerFound ? !inEnroute : p <= baseEndPage) continue;
 
@@ -4809,7 +4860,15 @@ if (
             row.text = row.items.map(i => i.text).join(" ");
         }
 
-        currentNotam.rows.sort((a, b) => a.y - b.y);
+        // Page header / footer lines ("SIA 321/23Oct26/..." and "Page 49 of 173")
+        // are not part of the NOTAM and would break row pairing across a page break
+        currentNotam.rows = currentNotam.rows.filter(row =>
+            !/^\s*Page \d+ of \d+\s*$/.test(row.text) &&
+            !/^\s*SIA \d+\/\d{2}[A-Za-z]{3}\d{2}\//.test(row.text)
+        );
+
+        // Rows are ordered by page first, then by position on the page
+        currentNotam.rows.sort((a, b) => (a.page - b.page) || (a.y - b.y));
 
         console.log(
             currentNotam.id,
@@ -4820,6 +4879,10 @@ if (
         );
 
         extractedNotams.push(currentNotam);
+
+        // Finished: without this the last NOTAM before "DESTINATION ALTERNATE(S)"
+        // was pushed a second time by the final call below (double highlight)
+        currentNotam = null;
     }
 
     for (let p = notamStartPage; p <= notamEndPage && !stopNotamExtraction; p++) {
@@ -4894,12 +4957,15 @@ if (
                     page: p
                 };
 
+                // same line only if on the same page (page header / continuation
+                // lines on the next page share y positions)
                 let row = currentNotam.rows.find(
-                    r => Math.abs(r.y - ty) <= ROW_TOLERANCE
+                    r => r.page === p && Math.abs(r.y - ty) <= ROW_TOLERANCE
                 );
 
                 if (!row) {
                     row = {
+                        page: p,
                         y: ty,
                         items: []
                     };
@@ -7598,7 +7664,7 @@ async function findDecompressionProfiles(highGroundWaypoints, airways){
 //   PROFILE_FINDER = "legacy"  -> original Quick Search Table matcher, unchanged
 //==================================================
 const PROFILE_FINDER = "v2";
-const COMPARE_PROFILE_FINDERS = true;   // also run legacy and log the differences (testing)
+const COMPARE_PROFILE_FINDERS = false;   // also run legacy and log the differences (testing)
 const WARN_UNCOVERED_TERRAIN = false;   // true = add an extraction warning when terrain is left uncovered
 const PROFILE_MIN_NEW_TERRAIN = 2;      // a profile must cover at least this many still-uncovered terrain waypoints
 const PROFILE_MAX_GAP_LEGS = 6;         // unlabeled terrain waypoints count as covered only between profile waypoints <= this many legs apart
@@ -11039,6 +11105,46 @@ for (let i = 0; i < pagesToRender.length; i++) {
             }
 
             // -----------------------------------------
+            // INITIAL CRUISE FL HIGHLIGHT
+            // Level profile line "SIN/310/SURGA/330/20S127E/350/EVONN/370":
+            // the first level after the departure airport is highlighted
+            // (OFP page 1, the first legs page and the ATC flight plan page).
+            // -----------------------------------------
+            if (
+                (Number(pageNum) === 1 ||
+                    Number(pageNum) === Number(sidPage) ||
+                    Number(pageNum) === Number(atcFlightPlanPage)) &&
+                typeof str === "string"
+            ) {
+                const cm = str.match(/^\s*([A-Z]{3,4})\/(\d{3})\/[A-Z0-9]/);
+
+                if (cm) {
+                    const flStart = str.indexOf("/", cm.index) + 1;
+                    const tx = item.transform[4] * scale;
+                    const ty = viewport.height - item.transform[5] * scale;
+                    const charWidth = (item.width * scale) / str.length;
+
+                    const hx = tx + flStart * charWidth;
+                    const hw = 3 * charWidth;
+                    const hy = ty - item.height * scale + 4;
+                    const hh = item.height * scale;
+
+                    octx.save();
+                    octx.fillStyle = "rgba(255, 235, 59, 0.5)";
+                    octx.fillRect(hx, hy, hw, hh);
+                    octx.restore();
+
+                    atcFlightPlanHighlights.push({
+                        page: pageNum - 1,
+                        x: hx / scale,
+                        y: (viewport.height - hy - hh) / scale,
+                        width: hw / scale,
+                        height: hh / scale
+                    });
+                }
+            }
+
+            // -----------------------------------------
             // ATC FLIGHT PLAN HIGHLIGHTS
             // -----------------------------------------
             if (
@@ -11998,11 +12104,34 @@ for (let i = 0; i < pagesToRender.length; i++) {
             lines.push("");
             lines.push("CLB SCHED:");
 
-            for (const m of clbMatches) {
+            // A level reached within 20 minutes of the preceding level gets a
+            // note of how many minutes after it (e.g. "FL330 : 00.41 GUKNO (+8 mins)")
+            const clbMinutes = v => {
+                const t = String(v || "").match(/^(\d{1,2})\.(\d{2})$/);
+
+                return t ? Number(t[1]) * 60 + Number(t[2]) : null;
+            };
+
+            clbMatches.forEach((m, idx) => {
+                let note = "";
+
+                if (idx > 0) {
+                    const cur = clbMinutes(m.value);
+                    const prev = clbMinutes(clbMatches[idx - 1].value);
+
+                    if (cur !== null && prev !== null) {
+                        const gap = cur - prev;
+
+                        if (gap >= 0 && gap <= 20) {
+                            note = ` (+${gap} min${gap === 1 ? "" : "s"})`;
+                        }
+                    }
+                }
+
                 lines.push(
-                    `FL${m.code} : ${m.value} ${m.waypointBefore}`
+                    `FL${m.code} : ${m.value} ${m.waypointBefore}${note}`
                 );
-            }
+            });
 
             lines.push("");
             lines.push("IFM BRIEF:");
@@ -12397,32 +12526,6 @@ for (let i = 0; i < pagesToRender.length; i++) {
             }
 
             octx.restore();
-        }
-
-        // Bulletin list
-        if (pageNum === pdf.numPages) {
-            bulletinAnnotation = {
-                page: pdf.numPages - 1,
-                x: 65,
-                y: 190,
-                lineHeight: 20,
-                lines: bulletinAnnotations.slice(),
-                canvasHeight: octx.canvas.height
-            };
-
-            const startY = 190;
-            const lineHeight = 20;
-
-            octx.font = "12px Helvetica";
-            octx.fillStyle = "blue";
-
-            bulletinAnnotations.forEach((m, idx) => {
-                octx.fillText(
-                    `${idx + 1}. ${m}`,
-                    65,
-                    startY + idx * lineHeight
-                );
-            });
         }
 
     if (pageNum === 1) {
@@ -13481,30 +13584,6 @@ document.getElementById("downloadBtn").addEventListener("click", async () => {
                 color: PDFLib.rgb(1, 0, 0)
             }
         );
-    }
-
-    if (bulletinAnnotation) {
-        const page = pdfPages[bulletinAnnotation.page];;
-
-        const pdfY =
-            (bulletinAnnotation.canvasHeight - bulletinAnnotation.y) / scale;
-
-        let y = bulletinAnnotation.y;
-
-        for (let i = 0; i < bulletinAnnotation.lines.length; i++) {
-            page.drawText(
-                `${i + 1}. ${bulletinAnnotation.lines[i]}`,
-                {
-                    x: bulletinAnnotation.x / scale,
-                    y: (bulletinAnnotation.canvasHeight - y) / scale,
-                    size: 8,
-                    font: unicodeFont,
-                    color: PDFLib.rgb(0, 0, 1)
-                }
-            );
-
-            y += bulletinAnnotation.lineHeight;
-        }
     }
 
     // INTAM age labels

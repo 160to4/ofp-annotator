@@ -1943,6 +1943,8 @@ let legsProfileHighlights = [];
 let legsNumberHighlights = [];
 let highGroundWxHighlights = [];
 let destinationNotamAnnotation = null;
+let departureNotamAnnotation = null;
+let initialFlHighlighted = false;   // only the first "SIN/310/..." line is highlighted
 let blockTimeAnnotation = null;
 let vwsAnnotation = null;
 let netTimeAnnotation = null;
@@ -2095,6 +2097,8 @@ function resetState() {
     legsNumberHighlights = [];
     highGroundWxHighlights = [];
     destinationNotamAnnotation = null;
+    departureNotamAnnotation = null;
+    initialFlHighlighted = false;
     blockTimeAnnotation = null;
     vwsAnnotation = null;
     netTimeAnnotation = null;
@@ -10522,18 +10526,49 @@ for (let i = 0; i < pagesToRender.length; i++) {
             ) {
                 const token = (item.str || "").trim().toUpperCase();
 
-                if (token.includes("DESTINATION AIRPORT")) {
-                    const t = item.transform;
+                const notamLabelKind =
+                    token.includes("DESTINATION AIRPORT") ? "destination" :
+                    token.includes("DEPARTURE AIRPORT") ? "departure" : null;
 
-                    destinationNotamAnnotation = {
+                if (notamLabelKind) {
+                    const t = item.transform;
+                    const labelText =
+                        notamLabelKind === "destination"
+                            ? "DESTINATION NOTAMS"
+                            : "DEPARTURE NOTAMS";
+
+                    // relevant period = scheduled departure / arrival +/- 1 hour
+                    // (same window the NOTAM highlighting uses), UTC
+                    const refTime =
+                        notamLabelKind === "destination"
+                            ? arrDateTime
+                            : depDateTime;
+
+                    const hm = d =>
+                        String(d.getUTCHours()).padStart(2, "0") + ":" +
+                        String(d.getUTCMinutes()).padStart(2, "0");
+
+                    const periodText =
+                        refTime instanceof Date && !isNaN(refTime)
+                            ? `${hm(new Date(refTime.getTime() - 3600000))} to ${hm(new Date(refTime.getTime() + 3600000))} highlighted`
+                            : "";
+
+                    const annotation = {
                         page: pageNum - 1,
-                        text: "DESTINATION NOTAMS",
+                        text: labelText,
+                        period: periodText,
                         x: t[4] + item.width + 14,
                         y: t[5] - 3,
                         size: 18,
                         color: PDFLib.rgb(1, 0, 0),
                         bold: true
                     };
+
+                    if (notamLabelKind === "destination") {
+                        destinationNotamAnnotation = annotation;
+                    } else {
+                        departureNotamAnnotation = annotation;
+                    }
 
                     const tx = t[4] * scale;
                     const ty = viewport.height - (t[5] * scale);
@@ -10544,10 +10579,23 @@ for (let i = 0; i < pagesToRender.length; i++) {
                     octx.fillStyle = "red";
 
                     octx.fillText(
-                        "DESTINATION NOTAMS",
+                        labelText,
                         tx + (item.width * scale) + 20,
                         ty
                     );
+
+                    if (periodText) {
+                        const lw = octx.measureText(labelText).width;
+
+                        octx.font = "11px Helvetica";
+                        octx.fillStyle = "blue";
+
+                        octx.fillText(
+                            periodText,
+                            tx + (item.width * scale) + 20 + lw + 14,
+                            ty
+                        );
+                    }
 
                     octx.restore();
                 }
@@ -11108,17 +11156,18 @@ for (let i = 0; i < pagesToRender.length; i++) {
             // INITIAL CRUISE FL HIGHLIGHT
             // Level profile line "SIN/310/SURGA/330/20S127E/350/EVONN/370":
             // the first level after the departure airport is highlighted
-            // (OFP page 1, the first legs page and the ATC flight plan page).
+            // (first occurrence only, normally page 1).
             // -----------------------------------------
             if (
-                (Number(pageNum) === 1 ||
-                    Number(pageNum) === Number(sidPage) ||
-                    Number(pageNum) === Number(atcFlightPlanPage)) &&
+                !initialFlHighlighted &&
+                (sidPage === null || Number(pageNum) <= Number(sidPage)) &&
                 typeof str === "string"
             ) {
                 const cm = str.match(/^\s*([A-Z]{3,4})\/(\d{3})\/[A-Z0-9]/);
 
                 if (cm) {
+                    initialFlHighlighted = true;
+
                     const flStart = str.indexOf("/", cm.index) + 1;
                     const tx = item.transform[4] * scale;
                     const ty = viewport.height - item.transform[5] * scale;
@@ -12237,8 +12286,8 @@ for (let i = 0; i < pagesToRender.length; i++) {
 
                 const lines = [
                     "Crew Rest:",
-                    `DBL: ${halfHM.hours}h ${halfHM.mins}m`,
-                    `AUG: ${thirdHM.hours}h ${thirdHM.mins}m`
+                    `DBL: ${halfHM.hours}h ${halfHM.mins}m (${adjusted % 2})`,
+                    `AUG: ${thirdHM.hours}h ${thirdHM.mins}m (${adjusted % 3})`
                 ];
 
                 crewRestAnnotation = {
@@ -13029,18 +13078,34 @@ document.getElementById("downloadBtn").addEventListener("click", async () => {
         );
     }
 
-    if (destinationNotamAnnotation) {
-        const page = pdfPages[destinationNotamAnnotation.page];
+    for (const ann of [destinationNotamAnnotation, departureNotamAnnotation]) {
+        if (!ann) continue;
+
+        const page = pdfPages[ann.page];
+
         page.drawText(
-            destinationNotamAnnotation.text,
+            ann.text,
             {
-                x: destinationNotamAnnotation.x,
-                y: destinationNotamAnnotation.y,
-                size: destinationNotamAnnotation.size,
-                color: destinationNotamAnnotation.color,
+                x: ann.x,
+                y: ann.y,
+                size: ann.size,
+                color: ann.color,
                 font: unicodeFont
             }
         );
+
+        if (ann.period) {
+            page.drawText(
+                ann.period,
+                {
+                    x: ann.x + unicodeFont.widthOfTextAtSize(ann.text, ann.size) + 10,
+                    y: ann.y,
+                    size: 8,
+                    color: PDFLib.rgb(0, 0, 1),
+                    font: unicodeFont
+                }
+            );
+        }
     }
 
     if (blockTimeAnnotation) {

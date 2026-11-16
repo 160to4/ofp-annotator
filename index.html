@@ -2066,6 +2066,13 @@ function resetState() {
     viewer.innerHTML = "";
     renderedPages.length = 0;
 
+    // ATC flight plan / initial FL highlights and SID / STAR names were never
+    // cleared, so a second OFP loaded in the same session drew the previous
+    // OFP's highlights (and names) on its own pages.
+    atcFlightPlanHighlights = [];
+    sidName = "";
+    starName = "";
+
     textAnnotations = [];
     originalPdfBuffer = null;
     planHighlight = null;
@@ -2630,6 +2637,7 @@ fileInput.addEventListener("change", async (e) => {
                 /^(?:[A-Z]{2}|[A-Z]{3}|[A-Z]{5})$/.test(token) ||
                 /^\d{2}[NSEW]\d{2}$/.test(token) ||
                 /^[A-Z]{2}\d{2}[A-Z]$/.test(token) ||
+                /^[A-Z]{2}\d{3}$/.test(token) ||   // e.g. PD208, PD407 (STAR / descent fixes)
                 /^(?=[0-9NSEW]{5}$)(?=.*[NSEW])(?=.*\d)[0-9NSEW]+$/.test(token)
             ) {
                 let trkToken = null;
@@ -4235,8 +4243,10 @@ fileInput.addEventListener("change", async (e) => {
                     const matches = raw.match(/\d{5}/g) || [];
 
                     clbWinds = matches.slice(0, 4).map(w => ({
-                        dir: w.slice(0, 3),
-                        spd: w.slice(3)
+                        // format ddsss: direction in tens of degrees, speed 3 digits
+                        // (e.g. 23108 = 230 deg / 108 kt)
+                        dir: w.slice(0, 2) + "0",
+                        spd: String(Number(w.slice(2)))
                     }));
                 }
 
@@ -4249,8 +4259,10 @@ fileInput.addEventListener("change", async (e) => {
                     const matches = raw.match(/\d{5}/g) || [];
 
                     desWinds = matches.slice(0, 4).map(w => ({
-                        dir: w.slice(0, 3),
-                        spd: w.slice(3)
+                        // format ddsss: direction in tens of degrees, speed 3 digits
+                        // (e.g. 23108 = 230 deg / 108 kt)
+                        dir: w.slice(0, 2) + "0",
+                        spd: String(Number(w.slice(2)))
                     }));
                 }
             }
@@ -6694,7 +6706,19 @@ function isApplicableWeatherLine(line, applicable) {
         groups = groups.filter(g => g.type !== "FM" || g === latestFM);
     }
 
-    return groups.some(g => line.includes(g.raw));
+    // Compare ignoring spaces and "=": a group's raw text ends in " =" when
+    // it is the last group of a forecast, and a long line can be wrapped
+    // across two displayed lines, so exact substring matching missed those.
+    const norm = t => String(t || "").replace(/[\s=]+/g, "");
+    const nLine = norm(line);
+
+    if (nLine.length < 4) return false;
+
+    return groups.some(g => {
+        const nRaw = norm(g.raw);
+
+        return nRaw.includes(nLine) || nLine.includes(nRaw);
+    });
 }
 
 const depWxLines = buildWeatherLines(

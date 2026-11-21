@@ -3938,6 +3938,14 @@ fileInput.addEventListener("change", async (e) => {
                             continue;
                         }
 
+                        // the next airport section ("RECLEARANCE AIRPORT:",
+                        // "RECLEARANCE ALTERNATE:", "DESTINATION AIRPORT:" ...)
+                        // ends the departure block
+                        if (/\b(AIRPORT|ALTERNATE|ALTERNATES|ALTERNATE\(S\))\s*:/i.test(t2)) {
+                            finished = true;
+                            break;
+                        }
+
                         // once started, keep collecting
                         buf += " " + t2;
                     }
@@ -6781,7 +6789,8 @@ function buildWeatherLines(...groups) {
                 alert.severity === "warning" ||
                 alert.severity === "caution"
             ) {
-                lines.push(alert.text);
+                // warnings are drawn in red, cautions in blue
+                lines.push({ text: alert.text, warning: alert.severity === "warning" });
             }
 
             else if (
@@ -6791,14 +6800,14 @@ function buildWeatherLines(...groups) {
                     alert.text.includes("changing to QNH")
                 )
             ) {
-                infoLines.push(alert.text);
+                infoLines.push({ text: alert.text, warning: false });
             }
         }
     }
 
     // No cautions/warnings -> GOOD WEATHER first
     if (lines.length === 0) {
-        lines.push("GOOD WEATHER");
+        lines.push({ text: "GOOD WEATHER", warning: false });
     }
 
     // Always append QNH transition information afterwards
@@ -8657,8 +8666,9 @@ for (let i = 0; i < pagesToRender.length; i++) {
 
             depWxLines.forEach((line, i) => {
                 lines.push({
-                    text: `${i + 1}. ${line}`,
-                    highlight: false
+                    text: `${i + 1}. ${line.text}`,
+                    highlight: false,
+                    red: line.warning
                 });
             });
 
@@ -8694,8 +8704,9 @@ for (let i = 0; i < pagesToRender.length; i++) {
 
             destWxLines.forEach((line, i) => {
                 lines.push({
-                    text: `${i + 1}. ${line}`,
-                    highlight: false
+                    text: `${i + 1}. ${line.text}`,
+                    highlight: false,
+                    red: line.warning
                 });
             });
 
@@ -8728,7 +8739,7 @@ for (let i = 0; i < pagesToRender.length; i++) {
                     );
                 }
 
-                octx.fillStyle = "blue";
+                octx.fillStyle = line.red ? "red" : "blue";
 
                 octx.fillText(
                     line.text,
@@ -13850,7 +13861,7 @@ document.getElementById("downloadBtn").addEventListener("click", async () => {
                     y: y,
                     size: 6,
                     font: font,
-                    color: PDFLib.rgb(0,0,1)
+                    color: line.red ? PDFLib.rgb(1,0,0) : PDFLib.rgb(0,0,1)
                 }
             );
 

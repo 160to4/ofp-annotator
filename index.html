@@ -2035,6 +2035,9 @@ let sidStarAnnotation = null;
 let highGroundAnnotation = null;
 let decompProfilesAnnotation = null;
 let profileAirportsAnnotation = null;
+// ICAO -> where its SA / FT starts in the OFP weather list:
+// {page (1-based), pdfY (PDF points), canvasY (preview px)}
+let airportTafLocations = new Map();
 let edtoAnnotation = null;
 let firAnnotation = null;
 let weatherAnnotation = null;
@@ -2208,6 +2211,7 @@ function resetState() {
     highGroundAnnotation = null;
     decompProfilesAnnotation = null;
     profileAirportsAnnotation = null;
+    airportTafLocations = new Map();
     edtoAnnotation = null;
     firAnnotation = null;
     weatherAnnotation = null;
@@ -3986,7 +3990,10 @@ fileInput.addEventListener("change", async (e) => {
 
         scan:
         for (let p = wxStartPage; p <= wxEndPage; p++) {
-            for (const tk of pages[p - 1].tokens) {
+            const pgTokens = pages[p - 1].tokens;
+
+            for (let k = 0; k < pgTokens.length; k++) {
+                const tk = pgTokens[k];
                 const up = tk.toUpperCase();
 
                 const h = up.match(/^\s*([A-Z]{4})\/[A-Z0-9]{3}(?![A-Z0-9])/);
@@ -3994,6 +4001,18 @@ fileInput.addEventListener("change", async (e) => {
                 if (h) {
                     commit();
                     currentIcao = h[1];
+
+                    // where this airport's weather starts, for the page 2 links
+                    const it = pages[p - 1].items[k];
+
+                    if (it && !airportTafLocations.has(currentIcao)) {
+                        const pdfY = it.transform[5];
+                        const canvasY = pages[p - 1].viewport
+                            .convertToViewportPoint(it.transform[4], pdfY)[1];
+
+                        airportTafLocations.set(currentIcao, { page: p, pdfY, canvasY });
+                    }
+
                     continue;
                 }
 
@@ -9341,7 +9360,7 @@ for (let i = 0; i < pagesToRender.length; i++) {
 
                     if (d.left) {
                         // right-aligned so it sits one space before "<-", like the right side
-                        items.push({ text: d.left, x: colLArrow - sp, y, align: "r", red: d.leftBad });
+                        items.push({ text: d.left, x: colLArrow - sp, y, align: "r", red: d.leftBad, icao: d.left });
                     }
 
                     if (d.first) {
@@ -9359,7 +9378,7 @@ for (let i = 0; i < pagesToRender.length; i++) {
 
                     if (d.right) {
                         items.push({ text: "->", x: colRArrow, y, align: "l", red: false });
-                        items.push({ text: d.right, x: colRightIcao, y, align: "l", red: d.rightBad });
+                        items.push({ text: d.right, x: colRightIcao, y, align: "l", red: d.rightBad, icao: d.right });
                     }
 
                     if (d.rightWhy) {
@@ -9387,6 +9406,9 @@ for (let i = 0; i < pagesToRender.length; i++) {
                 // PREVIEW
                 octx.font = FONT;
 
+                // clickable airport codes (preview px): jump to the airport's TAF
+                profileAirportsAnnotation.links = [];
+
                 for (const it of items) {
                     octx.fillStyle = it.red ? "red" : "blue";
 
@@ -9397,6 +9419,16 @@ for (let i = 0; i < pagesToRender.length; i++) {
                         it.x;
 
                     octx.fillText(it.text, tx, it.y);
+
+                    if (it.icao && airportTafLocations.has(it.icao)) {
+                        profileAirportsAnnotation.links.push({
+                            icao: it.icao,
+                            x: tx - 2,
+                            y: it.y - lineH + 2,
+                            w: w + 4,
+                            h: lineH
+                        });
+                    }
                 }
 
                 console.log(
@@ -9462,6 +9494,39 @@ for (let i = 0; i < pagesToRender.length; i++) {
             blankOverlay.height = refViewport.height;
 
             drawAnnotationPage(blankOverlay.getContext("2d"), pageNum);
+
+            // Page 2 profile airports: click an ICAO to scroll to its TAF
+            const linkAt = ev => {
+                const links = profileAirportsAnnotation?.links || [];
+                const r = blankOverlay.getBoundingClientRect();
+                const px = (ev.clientX - r.left) * (blankOverlay.width / r.width);
+                const py = (ev.clientY - r.top) * (blankOverlay.height / r.height);
+
+                return links.find(l =>
+                    px >= l.x && px <= l.x + l.w && py >= l.y && py <= l.y + l.h
+                ) || null;
+            };
+
+            blankWrapper.addEventListener("mousemove", ev => {
+                blankWrapper.style.cursor = linkAt(ev) ? "pointer" : "";
+            });
+
+            blankWrapper.addEventListener("click", ev => {
+                const link = linkAt(ev);
+                if (!link) return;
+
+                const loc = airportTafLocations.get(link.icao);
+                const target = loc ? overlayByPage[loc.page] : null;
+                if (!target) return;
+
+                const tr = target.getBoundingClientRect();
+                const ratio = tr.height / target.height;
+
+                window.scrollTo({
+                    top: window.scrollY + tr.top + loc.canvasY * ratio - 80,
+                    behavior: "smooth"
+                });
+            });
 
             blankWrapper.appendChild(blankCanvas);
             blankWrapper.appendChild(blankOverlay);
@@ -14696,6 +14761,55 @@ document.getElementById("downloadBtn").addEventListener("click", async () => {
     uniquePagesToKeep.forEach((originalPage, index) => {
         pageMap[originalPage] = index;
     });
+
+    // -----------------------------
+    // PAGE 2 PROFILE AIRPORTS -> LINK TO THEIR TAF IN THE WX SECTION
+    // -----------------------------
+    if (profileAirportsAnnotation && airportTafLocations.size) {
+        const exportPages = exportDoc.getPages();
+        const srcIdx = pageMap[profileAirportsAnnotation.page];
+        const srcPage = srcIdx !== undefined ? exportPages[srcIdx] : null;
+
+        if (srcPage) {
+            const ctx = exportDoc.context;
+            let made = 0;
+
+            for (const it of profileAirportsAnnotation.items) {
+                if (!it.icao) continue;
+
+                const loc = airportTafLocations.get(it.icao);
+                const tgtIdx = loc ? pageMap[loc.page - 1] : undefined;
+                if (tgtIdx === undefined) continue;
+
+                const tgtPage = exportPages[tgtIdx];
+
+                // same geometry as the drawn text (size 6, canvas px / 1.5)
+                const size = 6;
+                const w = exportUnicodeFont.widthOfTextAtSize(it.text, size);
+                const x0 = it.x / 1.5;
+                const x =
+                    it.align === "r" ? x0 - w :
+                    it.align === "c" ? x0 - w / 2 :
+                    x0;
+                const yb = (profileAirportsAnnotation.canvasHeight - it.y) / 1.5;
+
+                const top = Math.min(tgtPage.getHeight(), loc.pdfY + 20);
+
+                const link = ctx.obj({
+                    Type: "Annot",
+                    Subtype: "Link",
+                    Rect: [x - 1, yb - 1.5, x + w + 1, yb + size - 0.5],
+                    Border: [0, 0, 0],
+                    Dest: [tgtPage.ref, PDFLib.PDFName.of("XYZ"), PDFLib.PDFNull, top, PDFLib.PDFNull]
+                });
+
+                srcPage.node.addAnnot(ctx.register(link));
+                made++;
+            }
+
+            console.log("PROFILE AIRPORT LINKS:", made);
+        }
+    }
 
         for (const h of notamHighlights) {
         const exportPageIndex = pageMap[h.page];

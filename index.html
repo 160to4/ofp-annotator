@@ -15090,10 +15090,10 @@ document.getElementById("downloadBtn").addEventListener("click", async () => {
     // last 3 characters of the registration (9VSWS -> SWS)
     const regSuffix = String(window.aircraftRegistration || "").slice(-3);
 
-    // <DEP><DEST><DATE> <FLIGHT TIME> <PLAN NUMBER><REG>, e.g. "SINAMS21NOV26 13.50 80SWS.pdf"
+    // <DEP><DEST><DATE> <FLIGHT TIME> <PLAN NUMBER> <REG>, e.g. "SINAMS21NOV26 13.50 80 SWS.pdf"
     const fileName =
         dep && arr && date
-            ? `${dep}${arr}${date} ${window.burnoffTime} ${cleanPlanNumber}${regSuffix}.pdf`
+            ? `${dep}${arr}${date} ${window.burnoffTime} ${cleanPlanNumber} ${regSuffix}.pdf`
             : "Annotated_OFP.pdf";
 
     const blob = new Blob([bytes], {

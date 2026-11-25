@@ -8076,6 +8076,7 @@ async function findDecompressionProfilesV2(legs, ofpAirways){
             startTime: named[best.span.s].time,   // elapsed hh.mm
             endTime: named[best.span.e].time,
             method: "COVERAGE",
+            routePos: Math.min(best.span.s, newlyCovered[0]),   // for OFP-order sorting
             covers: newlyCovered.map(i => named[i].name),
             ties
         });
@@ -8130,6 +8131,9 @@ async function findDecompressionProfilesV2(legs, ofpAirways){
     } catch (err) {
         console.warn("Profile half matching failed (whole profiles kept):", err);
     }
+
+    // list the profiles in the order they come up on the OFP route
+    finalPicks = [...finalPicks].sort((a, b) => (a.routePos ?? 0) - (b.routePos ?? 0));
 
     console.log("v2 RESULT:", finalPicks.map(p => p.profile + (p.side ? ` [${p.side}]` : "")));
     console.groupEnd();
@@ -8369,7 +8373,14 @@ async function splitProfilesByHalves(picks, candidates, named, posByName) {
             const s = Math.min(g.cpPos, h.end);
             const e = Math.max(g.cpPos, h.end);
 
+            // diagram end on this side to the CP, in flying order:
+            // "RASAM TO REBLO" (turn-back half), "MATAL TO ERIDU" (continue half)
+            const outer = h.names.length ? h.names[h.names.length - 1] : g.cp;
+            const segment = h.dir < 0 ? `${outer} TO ${g.cp}` : `${g.cp} TO ${outer}`;
+
             return {
+                segment,
+                routePos: s,
                 route: g.c.p.route,
                 waypoint: named[s].name,
                 airway: g.c.airwayMatches.join(", "),
@@ -13164,10 +13175,10 @@ for (let i = 0; i < pagesToRender.length; i++) {
             lines.push("DECOMP PROFILES (BETA):");
 
             for (const p of profiles) {
+                // "REGET TO LEMOD: VUVEN (1)"; one side of a split pair shows
+                // the part of its diagram used, e.g. "RASAM TO REBLO: REBLO (1)"
                 lines.push(
-                    p.side
-                        ? profileLabel(p)          // one side of a split pair
-                        : `${p.route} -> ${p.profile}`
+                    `${p.side && p.segment ? p.segment : p.route}: ${p.profile}`
                 );
             }
 
